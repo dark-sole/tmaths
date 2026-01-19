@@ -1,0 +1,9 @@
+# Compiler output
+/out/
+/cache/
+
+# macOS
+.DS_Store
+
+# Foundry lock (optional - some prefer to commit this)
+foundry.lock
