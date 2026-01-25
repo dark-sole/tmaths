@@ -4,7 +4,7 @@ Gas-efficient mathematical functions for Solidity, implemented in pure assembly.
 
 ## Overview
 
-TMaths provides `exp(x)`, `ln(x)`, and `sqrt(x)` functions optimized for EVM execution. All functions use 2^k decomposition to normalize inputs, then apply Taylor series (for exp/ln) or Newton-Raphson (for sqrt) on the bounded remainder.
+TMaths provides `exp(x)`, `ln(x)`, `sqrt(x)`, and trigonometric functions (`sin`, `cos`, `tan`) optimized for EVM execution. All functions use decomposition techniques to normalize inputs, then apply Taylor series or Newton-Raphson on the bounded remainder.
 
 **Requirements:** Solidity 0.8.31+ with Osaka EVM (`clz` opcode)
 
@@ -33,6 +33,15 @@ contract MyContract {
         
         // Square root: sqrt(x)
         uint256 root = TMaths.sqrt(10e18);            // sqrt(10) ≈ 3.162e18
+
+        // Trigonometry (radians, scaled by 1e18)
+        (uint256 sinVal, bool sinSign) = TMaths.sin(1e18);  // sin(1) ≈ 0.841e18
+        (uint256 cosVal, bool cosSign) = TMaths.cos(1e18);  // cos(1) ≈ 0.540e18
+        (uint256 tanVal, bool tanSign) = TMaths.tan(1e18);  // tan(1) ≈ 1.557e18
+
+        // Squared trig (more efficient than squaring)
+        uint256 sin2 = TMaths.sin_sq(1e18);           // sin²(1) ≈ 0.708e18
+        uint256 cos2 = TMaths.cos_sq(1e18);           // cos²(1) ≈ 0.292e18
     }
 }
 ```
@@ -76,14 +85,69 @@ Calculates the square root.
 
 Reverts with `ZeroInput()` if x is 0.
 
+### `sin(uint256 x) → (uint256 result, bool sign)`
+
+Calculates the sine of an angle in radians.
+
+| Parameter | Description |
+|-----------|-------------|
+| `x` | The angle in radians, scaled by 1e18 |
+| **Returns** | `result`: absolute value, scaled by 1e18 |
+| | `sign`: true if positive, false if negative |
+
+### `cos(uint256 x) → (uint256 result, bool sign)`
+
+Calculates the cosine of an angle in radians.
+
+| Parameter | Description |
+|-----------|-------------|
+| `x` | The angle in radians, scaled by 1e18 |
+| **Returns** | `result`: absolute value, scaled by 1e18 |
+| | `sign`: true if positive, false if negative |
+
+### `tan(uint256 x) → (uint256 result, bool sign)`
+
+Calculates the tangent of an angle in radians.
+
+| Parameter | Description |
+|-----------|-------------|
+| `x` | The angle in radians, scaled by 1e18 |
+| **Returns** | `result`: absolute value, scaled by 1e18 |
+| | `sign`: true if positive, false if negative |
+
+Note: Reverts when cos(x) ≈ 0 (at π/2, 3π/2, etc.) due to division by zero.
+
+### `sin_sq(uint256 x) → uint256`
+
+Calculates sin²(x) using the identity `sin²(x) = (1 - cos(2x)) / 2`.
+
+| Parameter | Description |
+|-----------|-------------|
+| `x` | The angle in radians, scaled by 1e18 |
+| **Returns** | Result scaled by 1e18 (always positive) |
+
+### `cos_sq(uint256 x) → uint256`
+
+Calculates cos²(x) using the identity `cos²(x) = (1 + cos(2x)) / 2`.
+
+| Parameter | Description |
+|-----------|-------------|
+| `x` | The angle in radians, scaled by 1e18 |
+| **Returns** | Result scaled by 1e18 (always positive) |
+
 ## Performance
 
 | Function | Gas | Max Error |
 |----------|-----|-----------|
-| `exp(true, x)` | ~654-745 | 0 bps |
-| `exp(false, x)` | ~757 | 0 bps |
-| `ln(x)` | ~859-930 | 8 bps* |
-| `sqrt(x)` | ~680-724 | 0 bps |
+| `exp(true, x)` | ~200-400 | < 0.01% |
+| `exp(false, x)` | ~200-400 | < 0.01% |
+| `ln(x)` | ~300-500 | 8 bps* |
+| `sqrt(x)` | ~200-400 | 0 bps |
+| `sin(x)` | ~440-690 | 5 ppm |
+| `cos(x)` | ~440-690 | 5 ppm |
+| `tan(x)` | ~880-1380 | 5 ppm |
+| `sin_sq(x)` | ~440-690 | 5 ppm |
+| `cos_sq(x)` | ~440-690 | 5 ppm |
 
 *Worst case error for ln() occurs at x = 1.5 and its multiples by powers of 2.
 
@@ -108,6 +172,13 @@ All three functions use **2^k decomposition** to normalize inputs to a small ran
 2. Normalize: `ratio = x / 2^k` where `ratio ∈ [1, 2)`
 3. Compute `sqrt(ratio)` using 4-iteration Newton-Raphson
 4. Result: `sqrt(x) = 2^(k/2) * sqrt(ratio)`
+
+### sin(x) / cos(x)
+1. **Fast path** (x < π/2): Direct Taylor series, always positive
+2. **Full path**: Octant reduction using `x * (4/π)` to get octant index
+3. Map to Taylor series for sin or cos based on octant
+4. Determine sign using bit patterns (cos: `0b11000011`, sin: `0b00001111`)
+5. Apply 4-term Taylor series on reduced angle θ < π/4
 
 ## Testing
 
