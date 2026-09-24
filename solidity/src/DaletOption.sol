@@ -8,22 +8,19 @@ import {FixedPointMathLib as FPML} from "solady/utils/FixedPointMathLib.sol";
 /// @notice Prices options in log space under the Dalet CDF D(x) = (1 + x/sqrt(1+x^2))/2.
 /// @dev The standard is PERP/reference/fundingbond/model.py (`dalet_price`) and its vectors.json.
 ///
-///      Log-return y = mu + s X, X Dalet, with
-///        m  = ln(S/K)                  log-moneyness
-///        mu = (r - sigma^2/2) T        drift
+///      Ruling 22'' (PERP HANDOFF): the log law is centred on the forward F = S e^{rT}, with no
+///      drift term, and each leg is priced under its own numeraire. With
 ///        s  = sigma sqrt(T)            scale
-///        w  = (m + mu)/s               standardised forward moneyness (w = -x*)
-///
-///      The log-space legs in closed form (dalet_updated.tex eq. (5) integrated out):
-///        call_log = e^{-rT} s (sqrt(1+w^2) + w)/2
-///        put_log  = e^{-rT} s (sqrt(1+w^2) - w)/2
-///      Where the sign of w makes one a difference, it is evaluated as
-///        s / (2 (sqrt(1+w^2) + |w|)): no CDF and no subtraction of near-equal terms.
-///
-///      Ruling 22 (PERP HANDOFF, dalet_updated.tex section 2.3 and section 5): the
-///      out-of-the-money leg is priced in log space, S <= K the call and S > K the put, and
-///      converted to price as S expm1(leg_log). The other leg follows by price-space parity,
-///      C - P = S - K e^{-rT}.
+///        w  = ln(F/K)/s                standardised forward moneyness
+///        q  = sqrt(1 + w^2)
+///      the log legs are
+///        C_log = s (q + w)/2,  P_log = s (q - w)/2   (C_log - P_log = ln(F/K))
+///      whichever of q + w, q - w is a difference evaluated as 1/(q + |w|), and the prices
+///        C = S (1 - e^{-C_log})             the call in the asset, bounded by S
+///        P = K e^{-rT} (1 - e^{-P_log})     the put in cash, bounded by K e^{-rT}
+///      One formula on both sides of the money: no leg selection and no parity step. Price
+///      parity C - P = S - K e^{-rT} is an identity of the exact prices (F e^{-C_log} =
+///      K e^{-P_log}); the prices returned depart from it by their rounding only.
 ///
 ///      Maths: Solady FixedPointMathLib v0.1.26 (`lnWad`, `expWad`, `sqrt`), ruling 23. The scale,
 ///      w and the log legs are carried at 1e27 (RAY) so that the WAD output is not rounded twice.
@@ -31,11 +28,13 @@ import {FixedPointMathLib as FPML} from "solady/utils/FixedPointMathLib.sol";
 ///      Rounding: call and put are amounts a payer is charged, so each is rounded up: the result
 ///      is never below the exact price (tested against the vectors). The margin covering the
 ///      approximation error of lnWad and expWad is MARGIN_WEI plus MARGIN_PER_UNIT wei per unit
-///      of S + K; see `_margin`.
+///      of S + K; see `_margin`. Each price carries one margin, so C - P departs from
+///      S - K e^{-rT} by at most the two margins.
 ///
-///      Deltas are the probabilities of exercise, as in dalet_updated.tex Table 3:
-///        delta_call = 1 - D(x*) = D(w),  delta_put = D(x*) = D(-w),  summing to exactly 1e18,
-///      the smaller computed by the stable tail D(-a) = 1/(2 q (q + a)), q = sqrt(1+a^2), a >= 0.
+///      Deltas are the derivatives of the prices in S (ruling 22''):
+///        delta_call = dC/dS = 1 - e^{-C_log} (1 - D(w)),  delta_put = -dP/dS = 1 - delta_call,
+///      returned as magnitudes summing to exactly 1e18; 1 - D(w) by the stable tail
+///      D(-a) = 1/(2 q (q + a)), q = sqrt(1+a^2), a >= 0.
 ///
 ///      Inputs (all scaled 1e18):
 ///        S     - spot price (e.g. 100e18 = $100)
@@ -47,12 +46,11 @@ import {FixedPointMathLib as FPML} from "solady/utils/FixedPointMathLib.sol";
 ///      Outputs (all scaled 1e18):
 ///        call_price  - call option price in quote terms, rounded up
 ///        put_price   - put option price in quote terms, rounded up
-///        delta_call  - call probability of exercise in [0, 1e18]
-///        delta_put   - put probability of exercise in [0, 1e18] (represents a negative delta)
+///        delta_call  - dC/dS in [0, 1e18]
+///        delta_put   - -dP/dS in [0, 1e18] (the magnitude of a negative delta)
 ///
 ///      Reverts: ZeroSpot, ZeroStrike, ZeroTime, ZeroVol on a zero input; ZeroScale when
-///      s = sigma sqrt(T) is below 1e-18 (it would round to zero at WAD); NegativeParityLeg when
-///      the leg derived by parity is below zero (at the money when r is large against sigma).
+///      s = sigma sqrt(T) is below 1e-18 (it would round to zero at WAD).
 library DaletOption {
 
     error ZeroSpot();
@@ -60,24 +58,23 @@ library DaletOption {
     error ZeroTime();
     error ZeroVol();
     error ZeroScale();
-    error NegativeParityLeg();
 
     uint256 internal constant WAD = 1e18;
     uint256 internal constant RAY = 1e27;
 
-    /// @dev expm1 sums its Taylor series below this argument (0.5, RAY) and uses expWad above.
-    ///      At 0.5 the series needs 27 terms to reach 1e-27; above it, expm1 >= 0.65 and the
-    ///      subtraction of 1 from expWad costs no significant figure.
+    /// @dev expm1 and 1 - e^{-y} sum their Taylor series below this argument (0.5, RAY) and use
+    ///      expWad above. At 0.5 the series needs 27 terms to reach 1e-27; above it, the result
+    ///      is at least 0.39 and the subtraction from 1 costs no significant figure.
     uint256 internal constant EXPM1_SERIES_BELOW = 5e26;
 
     /// @dev |w| above which sqrt(1 + w^2) is taken as |w| (relative error below 1e-22) and
     ///      w^2 at RAY would overflow.
     uint256 internal constant W_LARGE = 1e38;
 
-    /// @dev Rounding margin: covers lnWad (about 1 wei each of ln S and ln K) and expWad
-    ///      (about 1e-18 relative) carried through the price conversion and K e^{-rT}: about
-    ///      1 wei per unit of S + K each, bounded here by 4. Measured against the vectors the
-    ///      error before the margin is below 0.1 wei per unit of S + K (118 wei at S = 2500).
+    /// @dev Rounding margin: covers lnWad (about 1 wei each of ln S and ln K), whose error moves
+    ///      a leg by at most the same in log (dC_log/d ln F = D(w) <= 1), and expWad (about 1e-18
+    ///      relative) in e^{-rT} and 1 - e^{-leg}: about 1 wei per unit of S + K each, bounded
+    ///      here by 4. See the vector test for the error measured before the margin.
     uint256 internal constant MARGIN_WEI = 4;
     uint256 internal constant MARGIN_PER_UNIT = 4;
 
@@ -99,51 +96,37 @@ library DaletOption {
         if (sigma == 0) revert ZeroVol();
 
         // s^2 = sigma^2 T, exact at 1e54; s at RAY.
-        uint256 s2 = sigma * sigma * T;
-        uint256 s = FPML.sqrt(s2);
+        uint256 s = FPML.sqrt(sigma * sigma * T);
         if (s < 1e9) revert ZeroScale();
 
-        // m + mu at RAY: m from lnWad, mu = rT - s^2/2.
-        int256 mm = (FPML.lnWad(int256(S)) - FPML.lnWad(int256(K))) * 1e9
-            + int256(r * T / 1e9) - int256(s2 / (2 * RAY));
+        // ln(F/K) = ln S - ln K + rT at RAY: ln from lnWad, rT exact at 1e36.
+        int256 lfk = (FPML.lnWad(int256(S)) - FPML.lnWad(int256(K))) * 1e9 + int256(r * T / 1e9);
 
         // |w| and q = sqrt(1 + w^2), RAY.
-        uint256 a = FPML.fullMulDiv(uint256(mm < 0 ? -mm : mm), RAY, s);
+        uint256 a = FPML.fullMulDiv(uint256(lfk < 0 ? -lfk : lfk), RAY, s);
         uint256 q = _sqrt1p(a);
 
-        // Deltas: the smaller by the stable tail, the other its complement.
-        uint256 tail = _tail(q, a);
-        (delta_call, delta_put) = mm > 0 ? (WAD - tail, tail) : (tail, WAD - tail);
+        // The log legs, RAY: the larger s (q + |w|)/2, the smaller s / (2 (q + |w|)).
+        uint256 big = FPML.fullMulDiv(s, q + a, 2 * RAY);
+        uint256 small = FPML.fullMulDiv(s, RAY, 2 * (q + a));
+        (uint256 cLog, uint256 pLog) = lfk >= 0 ? (big, small) : (small, big);
 
-        // Discount e^{-rT}, WAD.
-        uint256 disc = uint256(FPML.expWad(-int256(r * T / WAD)));
+        // 1 - e^{-leg}, RAY, each rounded up so that the prices are.
+        uint256 omC = _oneMinusExpNegRay(cLog);
+        uint256 omP = _oneMinusExpNegRay(pLog);
 
-        // The out-of-the-money leg, log space, RAY. The call's closed form is a difference
-        // when w < 0, the put's when w > 0; those are evaluated as s / (2 (q + |w|)).
-        bool callLeg = S <= K;
-        bool tailForm = callLeg ? mm < 0 : mm > 0;
-        uint256 leg = tailForm
-            ? FPML.fullMulDiv(s, RAY, 2 * (q + a))
-            : FPML.fullMulDiv(s, q + a, 2 * RAY);
-        leg = FPML.fullMulDiv(leg, disc, WAD);
+        // Discount e^{-rT}, WAD, rounded up by one wei for the put.
+        uint256 disc = uint256(FPML.expWad(-int256(r * T / WAD))) + 1;
 
         uint256 margin = _margin(S, K);
-        uint256 otm = FPML.fullMulDivUp(S, _expm1Ray(leg), RAY) + margin;
+        call_price = FPML.fullMulDivUp(S, omC, RAY) + margin;
+        put_price = FPML.fullMulDivUp(FPML.fullMulDivUp(K, disc, WAD), omP, RAY) + margin;
 
-        if (callLeg) {
-            // P = C - S + K e^{-rT}: K e^{-rT} rounded up, so the put is too.
-            uint256 kd = FPML.fullMulDivUp(K, disc, WAD) + margin;
-            if (otm + kd < S) revert NegativeParityLeg();
-            call_price = otm;
-            put_price = otm + kd - S;
-        } else {
-            // C = P + S - K e^{-rT}: K e^{-rT} rounded down, so the call is rounded up.
-            uint256 kd = FPML.fullMulDiv(K, disc, WAD);
-            kd = kd > margin ? kd - margin : 0;
-            if (otm + S < kd) revert NegativeParityLeg();
-            put_price = otm;
-            call_price = otm + S - kd;
-        }
+        // Deltas: 1 - D(w) by the stable tail when w >= 0, else D(|w|) = 1 - tail.
+        uint256 tail = _tail(q, a);
+        uint256 survival = lfk >= 0 ? tail : WAD - tail;
+        delta_put = FPML.fullMulDiv(RAY - omC, survival, RAY);
+        delta_call = WAD - delta_put;
     }
 
     /// @notice The Dalet CDF D(x), x and result WAD, by the stable tail: for x < 0,
@@ -161,6 +144,11 @@ library DaletOption {
         return _expm1Ray(y);
     }
 
+    /// @notice 1 - e^{-y} = -expm1(-y) for y >= 0, argument and result at RAY, rounded up.
+    function oneMinusExpNegRay(uint256 y) internal pure returns (uint256) {
+        return _oneMinusExpNegRay(y);
+    }
+
     function _expm1Ray(uint256 y) private pure returns (uint256 sum) {
         if (y == 0) return 0;
         if (y < EXPM1_SERIES_BELOW) {
@@ -175,6 +163,32 @@ library DaletOption {
         }
         uint256 e = uint256(FPML.expWad(int256(y / 1e9)));
         return e * 1e9 + e * (y % 1e9) / WAD - RAY;
+    }
+
+    /// @dev Below the threshold, the alternating series y - y^2/2 + y^3/6 - ..., its positive
+    ///      and negative terms summed apart; each term is truncated, so one wei per term is
+    ///      added back to round up. Above, e^{-y} from expWad at WAD with a first-order
+    ///      correction for the argument's digits below WAD, rounded down, so 1 - e^{-y} is up.
+    function _oneMinusExpNegRay(uint256 y) private pure returns (uint256) {
+        if (y == 0) return 0;
+        if (y < EXPM1_SERIES_BELOW) {
+            uint256 term = y;
+            uint256 pos = y;
+            uint256 neg;
+            uint256 n = 2;
+            for (; ; ++n) {
+                term = term * y / (RAY * n);
+                if (term == 0) break;
+                if (n % 2 == 0) neg += term; else pos += term;
+            }
+            return pos - neg + n;
+        }
+        int256 x = -int256(y / 1e9);
+        if (x <= -41446531673892822313) return RAY; // expWad returns 0 below this: e^{-y} < 1e-18
+        uint256 e = uint256(FPML.expWad(x)) * 1e9;  // e^{-floor_WAD(y)}, RAY
+        uint256 corr = FPML.fullMulDivUp(e, y % 1e9, RAY); // first order in the sub-WAD digits
+        corr += 1e9;                                 // expWad's last wei, carried down
+        return RAY - (e > corr ? e - corr : 0);      // e^{-y} bounded below by 0
     }
 
     /// @dev sqrt(1 + a^2), a at RAY.

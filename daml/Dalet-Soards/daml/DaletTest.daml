@@ -13,8 +13,9 @@ import qualified DA.Numeric
 -- Tests European option pricing under the Dalet distribution. Until 24 September 2026 each
 -- script dumped its values through `assertMsg ... False` and failed by design; each now asserts.
 -- The cases of dalet_updated.tex Table 3 are checked against the reference vectors
--- (DaletVectors, from PERP vectors.json): the in-the-money leg is now derived by price-space
--- parity (ruling 22), where the 2025 pricer took it from log-space parity.
+-- (DaletVectors, from PERP vectors.json), now under ruling 22'': one formula on both sides of
+-- the money, the law centred on the forward. The Table 3 figures in the comments below are
+-- those of dalet_updated.tex, which is registered for amendment to 22''.
 -- ═══════════════════════════════════════════════════════════════════════════
 
 ulp : Numeric 18
@@ -84,11 +85,11 @@ testCDF = do
 testATM : Script ()
 testATM = checkVector "table3/K100" 100.0 100.0 0.25 0.05 0.20
 
--- | ITM call / OTM put: S=100, K=90 (Table 3: 13.01, 1.89). The call is the parity leg.
+-- | ITM call / OTM put: S=100, K=90 (Table 3: 13.01, 1.89). Under 22'' no leg is derived by parity.
 testITM : Script ()
 testITM = checkVector "table3/K90" 100.0 90.0 0.25 0.05 0.20
 
--- | OTM call / ITM put: S=100, K=110 (Table 3: 2.26, 10.89). The put is the parity leg.
+-- | OTM call / ITM put: S=100, K=110 (Table 3: 2.26, 10.89). Under 22'' no leg is derived by parity.
 testOTM : Script ()
 testOTM = checkVector "table3/K110" 100.0 110.0 0.25 0.05 0.20
 

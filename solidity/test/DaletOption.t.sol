@@ -56,11 +56,11 @@ contract DaletOptionTest is Test {
         assertLt(dp, 0.5e18, "delta put < 0.5");
         // Delta call + delta put = 1
         assertEq(dc + dp, 1e18, "delta call + delta put = 1");
-        // Vector table3/one_year (dalet_updated.tex Table 3: 11.68, 6.80, 0.574, 0.426):
-        // rounded up, within the rounding margin of the exact value
-        _assertUp(c, 11678672264171196194, "table3/one_year call");
-        _assertUp(p, 6801614714242597103, "table3/one_year put");
-        assertApproxEqAbs(dc, 574170226465122315, 2, "table3/one_year delta call");
+        // Vector table3/one_year under ruling 22'' (dalet_updated.tex Table 3, 11.68 and 6.80
+        // under ruling 22, is registered for amendment): rounded up, within the rounding margin
+        _assertUp(c, 12021493058336776333, "table3/one_year call");
+        _assertUp(p, 7144435508408177242, "table3/one_year put");
+        assertApproxEqAbs(dc, 666797076145982128, 3, "table3/one_year delta call");
     }
 
     /// @dev At or above the exact value (its ceiling), within 3 margins at S + K = 200.
@@ -88,11 +88,10 @@ contract DaletOptionTest is Test {
         assertLt(c, p, "OTM call < put");
         // Call delta < 0.5
         assertLt(dc, 0.5e18, "OTM call delta < 0.5");
-        // Vector table3/K110 (Table 3: 2.26, 10.89): the call priced in log space, the
-        // in-the-money put by price-space parity (ruling 22)
-        _assertUp(c, 2260609902030090203, "table3/K110 call");
-        _assertUp(p, 10894167956357047291, "table3/K110 put");
-        assertApproxEqAbs(dp, 829911834104856087, 2, "table3/K110 delta put");
+        // Vector table3/K110 under ruling 22'': both legs by one formula, no parity step
+        _assertUp(c, 2323889689083547239, "table3/K110 call");
+        _assertUp(p, 10957447743410504327, "table3/K110 put");
+        assertApproxEqAbs(dp, 799871313512258835, 3, "table3/K110 delta put (magnitude)");
     }
 
     // ═══════════════════════════════════════════════════════
@@ -114,11 +113,11 @@ contract DaletOptionTest is Test {
         assertGt(c, 10e18, "ITM call > intrinsic");
         // Call delta > 0.5
         assertGt(dc, 0.5e18, "ITM call delta > 0.5");
-        // Vector table3/K90 (Table 3: 13.01, 1.89). The in-the-money call was priced by log-space
-        // parity before ruling 22; it is now the out-of-the-money put plus S - K e^{-rT}.
-        _assertUp(c, 13008541500385034542, "table3/K90 call");
-        _assertUp(p, 1890543544834363068, "table3/K90 put");
-        assertApproxEqAbs(dc, 874231824363022343, 2, "table3/K90 delta call");
+        // Vector table3/K90 under ruling 22'': the in-the-money call in the asset,
+        // S (1 - e^{-C_log}), bounded by S; no parity step
+        _assertUp(c, 12734412728964343355, "table3/K90 call");
+        _assertUp(p, 1616414773413671881, "table3/K90 put");
+        assertApproxEqAbs(dc, 896380086427274825, 3, "table3/K90 delta call");
     }
 
     // ═══════════════════════════════════════════════════════
@@ -184,8 +183,8 @@ contract DaletOptionTest is Test {
 
     // ═══════════════════════════════════════════════════════
     // Put-call relationship check
-    // Price-space parity C - P = S - K e^{-rT} holds by construction (ruling 22); the
-    // rounding margins, one on each leg, are the only departure from it.
+    // Price-space parity C - P = S - K e^{-rT} is an identity of the exact prices (ruling 22'');
+    // the rounding margins, one on each leg, are the only departure from it.
     // ═══════════════════════════════════════════════════════
 
     function test_PutCallRelationship() public pure {

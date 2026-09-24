@@ -1,0 +1,101 @@
+-- Copyright © 2026 Tokenisys (The Dark Sole Enterprise Ltd). All rights reserved.
+--
+-- Stage 0 of PERP brief 2026-09-24c (rewritten) as a Daml Script scan of DaletOption.daml:
+-- ruling 22'' free of static arbitrage across strikes. At S 1, T 1, for the eight
+-- (sigma sqrt(T), r) cases, on strikes 0.02 to 50 at ratio 1.003 (2612), each consecutive triple
+-- K1 < K2 < K3 is checked for: the butterfly, in cross-multiplied form for the uneven spacing,
+-- (C3 - C2)(K2 - K1) >= (C2 - C1)(K3 - K2), and the same for the put; C falling and P rising with
+-- K; 0 <= -dC/dK <= e^{-rT}; the lower bounds C >= max(S - K e^{-rT}, 0) and
+-- P >= max(K e^{-rT} - S, 0); the upper bounds C <= S and P <= K e^{-rT}; P/K rising with K;
+-- the deltas in [0, 1] summing to one; and parity.
+--
+-- Each price is rounded up by at most u = 2 margins. The checks compare rounded prices, so each
+-- allows the rounding of the prices it combines, and nothing more.
+
+module DaletArbitrageTest where
+
+import Daml.Script
+import DA.Foldable (forA_)
+import DA.List ((!!))
+import qualified DA.Numeric as N
+import DaletOption
+import TMaths
+
+type N = Numeric 18
+
+cases : [(N, N)]
+cases = [(0.04, 0.0), (0.8, 0.0), (1.5, 0.0), (3.0, 0.0), (0.8, 0.05), (0.3, 0.2), (2.24, 0.1), (0.1, 0.05)]
+
+strikes : [N]
+strikes = strikesFrom 0.02
+
+strikesFrom : N -> [N]
+strikesFrom k = if k > 50.0 then [] else k :: strikesFrom (N.mul k (1.003 : N))
+
+data Row = Row with k : N; c : N; p : N; dc : N; dp : N
+
+row : N -> N -> N -> Row
+row r sigma k =
+  let res = daletPriceN 1.0 k 1.0 r sigma
+  in Row with k; c = res.callPrice; p = res.putPrice; dc = res.deltaCalls; dp = res.deltaPut
+
+-- | The rounding bound of one price at S 1 and strike k: two margins.
+u : N -> N
+u k = 2.0 * marginN 1.0 k
+
+check : Text -> W -> Row -> Row -> Row -> Script ()
+check lab dW a b c = do
+  let tol = u c.k
+      ulp = 0.000000000000000001
+      h1 = b.k - a.k
+      h2 = c.k - b.k
+      span = c.k - a.k
+      d : N = N.castAndRound dW
+      -- K e^{-rT} at 30 places, rounded once: the 18-place discount times K would carry K/2 ulp
+      kd : N = N.castAndRound (N.mul b.k dW : W)
+      at = lab <> " K " <> show b.k <> ": "
+  assertMsg (at <> "call butterfly") ((c.c - b.c) * h1 - (b.c - a.c) * h2 >= negate (tol * span) - ulp)
+  assertMsg (at <> "put butterfly") ((c.p - b.p) * h1 - (b.p - a.p) * h2 >= negate (tol * span) - ulp)
+  assertMsg (at <> "call falls with K") (a.c + tol >= b.c)
+  assertMsg (at <> "put rises with K") (c.p + tol >= b.p)
+  assertMsg (at <> "-dC/dK <= e^-rT") (a.c - b.c <= (d + ulp) * h1 + tol + ulp)
+  assertMsg (at <> "call lower bound") (b.c >= max (1.0 - kd - ulp) 0.0)
+  assertMsg (at <> "put lower bound") (b.p >= max (kd - ulp - 1.0) 0.0)
+  assertMsg (at <> "C <= S") (b.c <= 1.0 + tol)
+  assertMsg (at <> "P <= K e^-rT") (b.p <= kd + tol + ulp)
+  assertMsg (at <> "P/K rises with K") ((b.p + tol) * a.k + ulp >= a.p * b.k)
+  assertMsg (at <> "deltas sum to one") (b.dc + b.dp == 1.0)
+  assertMsg (at <> "deltas in [0, 1]") (b.dc >= 0.0 && b.dc <= 1.0 && b.dp >= 0.0 && b.dp <= 1.0)
+  assertMsg (at <> "parity") (abs (b.c - b.p - (1.0 - kd)) <= tol + ulp)
+
+scanCase : (N, N) -> Script ()
+scanCase (sigma, r) = do
+  let rows = map (row r sigma) strikes
+      d = expW (N.cast (negate r))
+      lab = "s " <> show sigma <> " r " <> show r
+  assertMsg "2612 strikes" (length rows == 2612)
+  forA_ (zip3 rows (drop 1 rows) (drop 2 rows)) \(a, b, c) -> check lab d a b c
+
+testStage0_s004_r0 : Script ()
+testStage0_s004_r0 = scanCase (cases !! 0)
+
+testStage0_s08_r0 : Script ()
+testStage0_s08_r0 = scanCase (cases !! 1)
+
+testStage0_s15_r0 : Script ()
+testStage0_s15_r0 = scanCase (cases !! 2)
+
+testStage0_s30_r0 : Script ()
+testStage0_s30_r0 = scanCase (cases !! 3)
+
+testStage0_s08_r005 : Script ()
+testStage0_s08_r005 = scanCase (cases !! 4)
+
+testStage0_s03_r02 : Script ()
+testStage0_s03_r02 = scanCase (cases !! 5)
+
+testStage0_s224_r01 : Script ()
+testStage0_s224_r01 = scanCase (cases !! 6)
+
+testStage0_s01_r005 : Script ()
+testStage0_s01_r005 = scanCase (cases !! 7)

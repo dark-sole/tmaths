@@ -4,7 +4,8 @@ gen_dalet_vectors.py - DaletOption.daml vectors from the funding bond reference.
 
 Reads PERP/reference/fundingbond/vectors.json (the standard, computed by model.py at 60 digits)
 and emits daml/DaletVectors.daml: every dalet_price vector, the p_atm vector (the put at
-S = K = 1), the D vectors, and the vectors on which the pricer must return Left. Each expected
+S = K = 1), the D vectors, and the vectors on which the pricer must return Left. The put
+delta is carried as the magnitude of the model's dP/dS. Each expected
 value is given at Numeric 18, floored and ceiled.
 
 Run:  python3 scripts/gen_dalet_vectors.py [path/to/vectors.json]
@@ -22,7 +23,12 @@ DEFAULT = os.path.join(HERE, "..", "..", "..", "..", "PERP", "reference", "fundi
 OUT = os.path.join(HERE, "..", "daml", "DaletVectors.daml")
 
 # The model prices edge/zero_scale (s = 1e-27); an 18-place implementation must refuse it.
-LEFT = {"edge/zero_scale": "ZeroScale", "edge/negative_parity_leg": "NegativeParityLeg"}
+LEFT = {"edge/zero_scale": "ZeroScale"}
+
+
+def neg(x):
+    """The negation of a fixed-point string."""
+    return x[1:] if x.startswith("-") else ("-" + x if x.strip("0.") else x)
 
 
 def lit(x):
@@ -44,8 +50,9 @@ def main():
                 lefts.append((vid, v["args"], LEFT[vid]))
                 continue
             o = v["outputs"]
-            fc = [o[k]["numeric18"][b] for k in ("call", "put", "delta_call", "delta_put")
-                  for b in ("floor", "ceil")]
+            fc = [o[k]["numeric18"][b] for k in ("call", "put", "delta_call") for b in ("floor", "ceil")]
+            # the model's put delta is dP/dS (negative); daletPrice returns its magnitude
+            fc += [neg(o["delta_put"]["numeric18"]["ceil"]), neg(o["delta_put"]["numeric18"]["floor"])]
             prices.append((vid, v["args"], fc, "True"))
         elif v["fn"] == "p_atm":
             sigma, h = v["args"]

@@ -5,22 +5,16 @@
 -- The standard is PERP/reference/fundingbond/model.py (`dalet_price`) and its vectors.json;
 -- the structure is that of solidity/src/DaletOption.sol.
 --
--- Log-return y = mu + s X, X Dalet, with
---   m  = ln(S/K)              log-moneyness
---   mu = (r - sigma^2/2) T    drift
---   s  = sigma sqrt(T)        scale
---   w  = (m + mu)/s           standardised forward moneyness (w = -x*)
---
--- The log-space legs in closed form, written in m + mu and s so that w, which is unbounded
--- as s falls, is never formed (R = s sqrt(1 + w^2) = sqrt(s^2 + (m + mu)^2)):
---   call_log = e^{-rT} (R + (m + mu))/2
---   put_log  = e^{-rT} (R - (m + mu))/2
--- Where the sign of m + mu makes one a difference it is evaluated as s^2 / (2 (R + |m + mu|)):
--- no CDF and no subtraction of near-equal terms.
---
--- Ruling 22 (PERP HANDOFF; dalet_updated.tex section 2.3 and section 5): the out-of-the-money
--- leg is priced in log space, S <= K the call and S > K the put, and converted to price as
--- S expm1(leg_log); the other leg follows by price-space parity, C - P = S - K e^{-rT}.
+-- Ruling 22'' (PERP HANDOFF): the log law is centred on the forward F = S e^{rT}, with no drift
+-- term, and each leg is priced under its own numeraire. With s = sigma sqrt(T) and
+-- w = ln(F/K)/s, the log legs are written in ln(F/K) and s, so that w, which is unbounded as s
+-- falls, is never formed (R = s sqrt(1 + w^2) = sqrt(s^2 + ln(F/K)^2)):
+--   C_log = (R + ln(F/K))/2,  P_log = (R - ln(F/K))/2
+-- the one that is a difference evaluated as s^2 / (2 (R + |ln(F/K)|)); and the prices
+--   C = S (1 - e^{-C_log})            the call in the asset, bounded by S
+--   P = K e^{-rT} (1 - e^{-P_log})    the put in cash, bounded by K e^{-rT}
+-- with 1 - e^{-x} as -expm1(-x). One formula on both sides of the money: no leg selection and
+-- no parity step. Price parity C - P = S - K e^{-rT} is an identity of the exact prices.
 --
 -- Ruling 25: Decimal at the interface, Numeric 18 inside. The pricer computes at 30 places
 -- (TMaths.W) and returns Numeric 18. `daletPrice` takes Decimal inputs and returns the same
@@ -28,16 +22,17 @@
 -- directed: `toDecimalUp` for an amount a payer is charged, `toDecimalDown` for one received.
 --
 -- Rounding: call and put are charged amounts, rounded up: each is at or above the exact price.
--- The margin covers the rounding to 18 places (half a unit each, of the leg and of K e^{-rT})
--- and the 30-place working error: 2 units in the last place plus one per 1e9 of S + K.
+-- The margin covers the rounding to 18 places (half a unit) and the 30-place working error:
+-- 2 units in the last place plus one per 1e9 of S + K. Each price carries one margin, so
+-- C - P departs from S - K e^{-rT} by at most the two margins.
 --
--- Deltas are the probabilities of exercise (dalet_updated.tex Table 3):
---   deltaCalls = 1 - D(x*) = D(w), deltaPut = D(x*) = D(-w), summing to exactly 1,
--- the smaller by the stable tail D(-|w|) = s^2 / (2 R (R + |m + mu|)), rounded to nearest.
+-- Deltas are the derivatives of the prices in S (ruling 22''):
+--   deltaCalls = dC/dS = 1 - e^{-C_log} (1 - D(w)),  deltaPut = -dP/dS = 1 - deltaCalls,
+-- returned as magnitudes summing to exactly 1; 1 - D(w) by the stable tail
+-- D(-|w|) = s^2 / (2 R (R + |ln(F/K)|)) when w >= 0, its complement when w < 0.
 --
 -- Errors (Left from daletPriceE): a non-positive S, K, T or sigma, a negative r; ZeroScale when
--- s < 1e-18; NegativeParityLeg when the leg derived by parity is below zero (at the money when
--- r is large against sigma).
+-- s < 1e-18.
 
 module DaletOption where
 
@@ -49,8 +44,8 @@ data OptionResult = OptionResult
   with
     callPrice  : Numeric 18  -- call price in quote terms, rounded up
     putPrice   : Numeric 18  -- put price in quote terms, rounded up
-    deltaCalls : Numeric 18  -- call probability of exercise in [0, 1]
-    deltaPut   : Numeric 18  -- put probability of exercise in [0, 1] (= 1 - deltaCalls)
+    deltaCalls : Numeric 18  -- dC/dS in [0, 1]
+    deltaPut   : Numeric 18  -- -dP/dS in [0, 1] (= 1 - deltaCalls), the magnitude of a negative delta
   deriving (Show, Eq)
 
 ulpN : N18
@@ -78,41 +73,34 @@ daletPriceE s k t r sigma
       else
         let
           rt : W = N.mul r t
-          -- m + mu
-          mm : W = lnW s - lnW k + rt - s2 / 2.0
-          am = abs mm
+          -- ln(F/K) = ln S - ln K + rT
+          lfk : W = lnW s - lnW k + rt
+          al = abs lfk
           -- R = s sqrt(1 + w^2)
-          big = sqrtW (s2 + mm * mm)
+          big = sqrtW (s2 + lfk * lfk)
 
-          -- Deltas: the smaller by the stable tail, the other its complement
-          tl : N18 = N.castAndRound (s2 / (2.0 * big * (big + am)))
-          (dC, dP) = if mm > 0.0 then (1.0 - tl, tl) else (tl, 1.0 - tl)
+          -- The log legs: the larger (R + |ln(F/K)|)/2, the smaller s^2 / (2 (R + |ln(F/K)|))
+          larger : W = (big + al) / 2.0
+          smaller : W = s2 / (2.0 * (big + al))
+          (cLog, pLog) = if lfk >= 0.0 then (larger, smaller) else (smaller, larger)
+
+          -- 1 - e^{-leg}
+          omC : W = negate (expm1W (negate cLog))
+          omP : W = negate (expm1W (negate pLog))
 
           -- Discount e^{-rT}
           disc : W = expW (negate rt)
 
-          -- The out-of-the-money leg in log space
-          callLeg = s <= k
-          tailForm = if callLeg then mm < 0.0 else mm > 0.0
-          legRaw : W = if tailForm then s2 / (2.0 * (big + am)) else (big + am) / 2.0
-          leg : W = legRaw * disc
-
           margin = marginN s k
-          otm : N18 = N.mul s (expm1W leg) + margin
-          kd : N18 = N.mul k disc
-        in if callLeg
-           then
-             -- P = C - S + K e^{-rT}, K e^{-rT} rounded up
-             let put = otm + (kd + margin) - s
-             in if put < 0.0 then Left "DaletOption: NegativeParityLeg"
-                else Right OptionResult with
-                  callPrice = otm; putPrice = put; deltaCalls = dC; deltaPut = dP
-           else
-             -- C = P + S - K e^{-rT}, K e^{-rT} rounded down
-             let call = otm + s - (kd - margin)
-             in if call < 0.0 then Left "DaletOption: NegativeParityLeg"
-                else Right OptionResult with
-                  callPrice = call; putPrice = otm; deltaCalls = dC; deltaPut = dP
+          call : N18 = N.mul s omC + margin
+          put : N18 = N.mul k (disc * omP) + margin
+
+          -- Deltas: 1 - D(w) by the stable tail when w >= 0, its complement when w < 0
+          tl : W = s2 / (2.0 * big * (big + al))
+          survival = if lfk >= 0.0 then tl else 1.0 - tl
+          dP : N18 = N.castAndRound ((1.0 - omC) * survival)
+        in Right OptionResult with
+             callPrice = call; putPrice = put; deltaCalls = 1.0 - dP; deltaPut = dP
 
 -- | The pricer, Numeric 18 in and out; aborts on inputs outside its domain.
 daletPriceN : N18 -> N18 -> N18 -> N18 -> N18 -> OptionResult

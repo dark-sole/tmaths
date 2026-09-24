@@ -21,7 +21,7 @@ contract DaletVectorWrapper {
 contract DaletOptionVectorsTest is Test {
 
     /// @dev Largest excess over the exact price allowed, in wei: three rounding margins
-    ///      (the leg and, for the parity leg, K e^{-rT}) plus PRICE_TOL_REL of the price.
+    ///      (each price's margin and its upward carries, ruling 22'') plus PRICE_TOL_REL of the price.
     uint256 internal constant PRICE_TOL_REL = 1e3; // 1e-15, in units of 1e-18
 
     /// @dev Delta tolerance in wei: the error of ln S - ln K divided by the scale s.
@@ -81,7 +81,7 @@ contract DaletOptionVectorsTest is Test {
     }
 
     function test_RevertVectors() public {
-        bytes4[2] memory sel = [DaletOption.ZeroScale.selector, DaletOption.NegativeParityLeg.selector];
+        bytes4[1] memory sel = [DaletOption.ZeroScale.selector];
         RevertVector[] memory vs = DaletOptionVectors.reverts(sel);
         assertGt(vs.length, 0);
         for (uint256 i = 0; i < vs.length; i++) {

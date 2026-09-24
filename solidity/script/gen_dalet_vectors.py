@@ -4,7 +4,9 @@ gen_dalet_vectors.py - DaletOption vectors from the funding bond reference.
 
 Reads PERP/reference/fundingbond/vectors.json (the standard, computed by model.py at 60 digits)
 and emits test/DaletOptionVectors.gen.sol: every dalet_price vector, the p_atm vector (the put at
-S = K = 1), the D vectors, and the vectors on which the pricer must revert.
+S = K = 1), the D vectors, and the vectors on which the pricer must revert. The model's put
+delta is dP/dS (negative); DaletOption returns its magnitude, so its floor and ceiling here are
+those of -dP/dS.
 
 Run:  python3 script/gen_dalet_vectors.py [path/to/vectors.json]
 Out:  test/DaletOptionVectors.gen.sol  (committed; regenerate when vectors.json changes)
@@ -22,7 +24,6 @@ OUT = os.path.join(HERE, "..", "test", "DaletOptionVectors.gen.sol")
 
 # Vectors the model prices but a WAD implementation must refuse, with the error it raises.
 WAD_REVERTS = {"edge/zero_scale": "ZeroScale"}
-MODEL_REVERTS = {"edge/negative_parity_leg": "NegativeParityLeg"}
 
 
 def wad(x):
@@ -40,17 +41,17 @@ def main():
         vid = v["id"]
         if v["fn"] == "dalet_price":
             args = [wad(a) for a in v["args"]]
-            if vid in WAD_REVERTS or vid in MODEL_REVERTS:
-                reverts.append((vid, args, WAD_REVERTS.get(vid) or MODEL_REVERTS[vid]))
+            if vid in WAD_REVERTS:
+                reverts.append((vid, args, WAD_REVERTS[vid]))
                 continue
             o = v["outputs"]
-            fc = [int(o[k]["wad"][b]) for k in ("call", "put", "delta_call", "delta_put")
-                  for b in ("floor", "ceil")]
+            fc = [int(o[k]["wad"][b]) for k in ("call", "put", "delta_call") for b in ("floor", "ceil")]
+            fc += [-int(o["delta_put"]["wad"]["ceil"]), -int(o["delta_put"]["wad"]["floor"])]
             prices.append((vid, args, fc, o["call"]["exact"], o["put"]["exact"]))
         elif v["fn"] == "p_atm":
             sigma, h = (wad(a) for a in v["args"])
             o = v["outputs"]["value"]["wad"]
-            # the put at S = K = 1 is p_atm; the call equals it by parity (r = 0)
+            # the put at S = K = 1 is p_atm; the call equals it (w = 0, ruling 22'')
             fc = [int(o["floor"]), int(o["ceil"])] * 2 + [0, 0, 0, 0]
             prices.append((vid, [10 ** 18, 10 ** 18, h, 0, sigma], fc,
                            v["outputs"]["value"]["exact"], v["outputs"]["value"]["exact"]))
@@ -112,12 +113,12 @@ def main():
         L.append('        v[%d] = CdfVector("%s", %d, %d, %d);' % (i, vid, x, f, c))
     L.append("    }")
     L.append("")
-    L.append("    function reverts(bytes4[2] memory sel) internal pure returns (RevertVector[] memory v) {")
-    L.append("        // sel: [ZeroScale, NegativeParityLeg]")
+    L.append("    function reverts(bytes4[1] memory sel) internal pure returns (RevertVector[] memory v) {")
+    L.append("        // sel: [ZeroScale]")
     L.append("        v = new RevertVector[](%d);" % len(reverts))
     for i, (vid, a, err) in enumerate(reverts):
         L.append('        v[%d] = RevertVector("%s", %s, sel[%d]);'
-                 % (i, vid, ", ".join(str(x) for x in a), 0 if err == "ZeroScale" else 1))
+                 % (i, vid, ", ".join(str(x) for x in a), 0))
     L.append("    }")
     L.append("}")
     L.append("")
