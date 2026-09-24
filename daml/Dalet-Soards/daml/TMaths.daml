@@ -1,0 +1,284 @@
+-- Copyright © 2025 Tokenisys (The Dark Sole Enterprise Ltd). All rights reserved.
+--
+-- TMaths: Core mathematical functions for option pricing on Canton Network
+--
+-- Ports exp, ln, sqrt from Solidity TMaths.sol (1e18 fixed-point assembly)
+-- to Daml Decimal (38 digits total, 10 fractional digits).
+--
+-- PRECISION LIMITATIONS (Daml Decimal vs Solidity 1e18):
+--   Solidity: 18 fractional digits → ~18 significant digits in [0,1]
+--   Daml:     10 fractional digits → ~10 significant digits in [0,1]
+--
+--   This 8-digit precision gap compounds through:
+--     - Taylor series term accumulation (each multiply truncates)
+--     - exp/ln composition in option pricing (d1/d2 → CDF → price)
+--     - Discount factor calculation
+--
+--   Expected degradation vs Solidity reference:
+--     exp:  ~0.01% (Solidity) → ~0.1-1% (Daml) for typical financial inputs
+--     ln:   ~0.1%  (Solidity) → ~0.5-2% (Daml)
+--     sqrt: ~0 bps (Solidity) → ~1-5 bps (Daml) — Newton-Raphson converges well
+--
+--   This is the precision ceiling that Fortress (FortVM) is designed to eliminate
+--   by providing IEEE 754 double (or quad) precision deterministic computation.
+
+module TMaths where
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- CONSTANTS
+-- ═══════════════════════════════════════════════════════════════════════════
+
+-- ln(2) — 10 fractional digits (Daml Decimal limit)
+-- True value: 0.69314718055994530941723212145817656807...
+-- Solidity:   0.693147180559945309 (18 digits)
+-- Daml:       0.6931471806          (10 digits — 8 digits lost)
+ln2 : Decimal
+ln2 = 0.6931471806
+
+-- 1/ln(2) for exp decomposition
+-- True value: 1.44269504088896340735992468100189213742...
+-- Solidity:   1.442695040888963407 (18 digits)
+-- Daml:       1.4426950409          (10 digits)
+invLn2 : Decimal
+invLn2 = 1.4426950409
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- HELPER: Integer power of 2
+-- ═══════════════════════════════════════════════════════════════════════════
+
+-- | Compute 2^k for any integer k (positive or negative).
+--   Used by exp (multiply by 2^k) and ln/sqrt (decomposition).
+--   Maximum |k| for financial inputs: ~30
+pow2 : Int -> Decimal
+pow2 k
+  | k == 0    = 1.0
+  | k > 0     = 2.0 * pow2 (k - 1)
+  | otherwise = pow2 (k + 1) / 2.0
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- HELPER: Truncate Decimal to integer (floor for positive values)
+-- ═══════════════════════════════════════════════════════════════════════════
+
+-- | Floor function: largest integer <= x.
+--   Daml's truncate rounds toward zero; we adjust for negative values.
+--   Used only on positive values in tExp, but handles negatives correctly.
+floorDecimal : Decimal -> Int
+floorDecimal x =
+  let n = truncate x
+  in if (intToDecimal n) > x then n - 1 else n
+
+-- intToDecimal is provided by Prelude (DA.Internal.Prelude)
+
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- EXPONENTIAL: e^x
+-- ═══════════════════════════════════════════════════════════════════════════
+
+-- | Compute e^x using 2^k decomposition + Taylor series.
+--
+--   Algorithm (same as Solidity TMaths.exp):
+--     1. k = floor(x / ln2)
+--     2. r = x - k * ln2         (remainder, r ∈ [0, ln2))
+--     3. e^r via Taylor: 1 + r + r²/2 + r³/6 + r⁴/24 + r⁵/120
+--     4. e^x = e^r * 2^k
+--
+--   For negative input: e^(-x) = 1 / e^x
+--
+--   PRECISION NOTE:
+--     Solidity uses 6 Taylor terms with 18-digit intermediates.
+--     Daml uses the same 6 terms but 10-digit intermediates.
+--     Each multiplication truncates, so by term 5 we've lost ~5 digits
+--     of the contribution. For r near ln(2) ≈ 0.693, term 5 ≈ 0.00013
+--     which is just 4 fractional digits — borderline for Daml Decimal.
+--
+--   Input range: |x| up to ~40 (beyond that, result overflows Decimal)
+--   Daml Decimal max: ~9.999...e27, so e^x overflows around x ≈ 64
+--   But precision degrades well before that.
+tExp : Decimal -> Decimal
+tExp x
+  | x == 0.0  = 1.0
+  | x < 0.0   = 1.0 / tExp (negate x)
+  | otherwise  =
+      let
+        -- Step 1: k = floor(x / ln2)
+        k : Int = floorDecimal (x * invLn2)
+
+        -- Step 2: remainder r = x - k * ln2
+        -- r should be in [0, ln2) ≈ [0, 0.693)
+        r : Decimal = x - (intToDecimal k) * ln2
+
+        -- Step 3: Taylor series for e^r (6 terms)
+        -- e^r ≈ 1 + r + r²/2! + r³/3! + r⁴/4! + r⁵/5!
+        r2 : Decimal = r * r
+        r3 : Decimal = r2 * r
+        r4 : Decimal = r3 * r
+        r5 : Decimal = r4 * r
+
+        taylor : Decimal = 1.0
+                         + r
+                         + r2 / 2.0
+                         + r3 / 6.0
+                         + r4 / 24.0
+                         + r5 / 120.0
+
+        -- Step 4: e^x = e^r * 2^k
+      in taylor * pow2 k
+
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- NATURAL LOGARITHM: ln(x)
+-- ═══════════════════════════════════════════════════════════════════════════
+
+-- | Reduce x downward by dividing by 2 until x ∈ [1.0, 2.0)
+reduceDown : Decimal -> Int -> (Int, Decimal)
+reduceDown v k
+  | v >= 2.0  = reduceDown (v / 2.0) (k + 1)
+  | otherwise  = (k, v)
+
+-- | Reduce x upward by multiplying by 2 until x ∈ [1.0, 2.0)
+reduceUp : Decimal -> Int -> (Int, Decimal)
+reduceUp v k
+  | v < 1.0   = reduceUp (v * 2.0) (k - 1)
+  | otherwise  = (k, v)
+
+-- | Find k such that x / 2^k ∈ [1.0, 2.0)
+--   Replaces Solidity's bitwise clz/shr with arithmetic loop.
+--   Returns (k, m) where m = x / 2^k and m ∈ [1.0, 2.0)
+findK : Decimal -> (Int, Decimal)
+findK x
+  | x >= 2.0  = reduceDown x 0
+  | x < 1.0   = reduceUp x 0
+  | otherwise  = (0, x)
+
+-- | Compute ln(x) using 2^k decomposition + Taylor series.
+--
+--   Algorithm (same as Solidity TMaths.ln):
+--     1. Handle x < 1 via ln(x) = -ln(1/x)
+--     2. Find k such that m = x / 2^k ∈ [1.0, 2.0)
+--     3. If m ≤ 1.5: compute ln(1 + (m-1)) via Taylor
+--        If m > 1.5:  compute ln(2·(1 - (2-m)/2)) = ln(2) + ln(1 - y)
+--     4. ln(x) = k·ln(2) + taylor_result
+--
+--   Taylor series (7 terms each):
+--     ln(1+x) = x - x²/2 + x³/3 - x⁴/4 + x⁵/5 - x⁶/6 + x⁷/7
+--     ln(1-x) = -(x + x²/2 + x³/3 + x⁴/4 + x⁵/5 + x⁶/6 + x⁷/7)
+--
+--   PRECISION NOTE:
+--     The Taylor variable x is in [0, 0.5) after decomposition.
+--     At x = 0.5, term 7 = 0.5^7/7 ≈ 0.0000011 — only 6 fractional digits.
+--     With Daml's 10-digit truncation, terms 6-7 contribute meaningfully
+--     but are partially truncated. Solidity retains all 7 terms fully.
+--     Worst case error: ~0.5-2% vs Solidity's ~0.1% (8 bps).
+tLn : Decimal -> Decimal
+tLn x
+  | x <= 0.0  = error "TMaths.tLn: input must be positive"
+  | x == 1.0  = 0.0
+  | x < 1.0   = negate (tLn (1.0 / x))
+  | otherwise  =
+      let
+        -- Step 1: find k, m such that x = m * 2^k, m ∈ [1.0, 2.0)
+        (k, m) = findK x
+
+        -- Step 2: choose Taylor branch based on m
+        -- If m > 1.5, work from 2 downward for better convergence
+      in if m <= 1.5
+         then
+           let
+             -- ln(1 + y) where y = m - 1, y ∈ [0, 0.5]
+             y : Decimal = m - 1.0
+             y2 : Decimal = y * y
+             y3 : Decimal = y2 * y
+             y4 : Decimal = y3 * y
+             y5 : Decimal = y4 * y
+             y6 : Decimal = y5 * y
+             y7 : Decimal = y6 * y
+             taylor : Decimal = y
+                              - y2 / 2.0
+                              + y3 / 3.0
+                              - y4 / 4.0
+                              + y5 / 5.0
+                              - y6 / 6.0
+                              + y7 / 7.0
+           in (intToDecimal k) * ln2 + taylor
+         else
+           let
+             -- ln(2·(1 - (2-m)/2)) = ln(2) + ln(1 - y) where y = (2 - m)/2
+             -- y ∈ [0, 0.25) since m ∈ (1.5, 2.0)
+             y : Decimal = (2.0 - m) / 2.0
+             y2 : Decimal = y * y
+             y3 : Decimal = y2 * y
+             y4 : Decimal = y3 * y
+             y5 : Decimal = y4 * y
+             y6 : Decimal = y5 * y
+             y7 : Decimal = y6 * y
+             -- ln(1-y) = -(y + y²/2 + y³/3 + ... )
+             taylor : Decimal = y
+                              + y2 / 2.0
+                              + y3 / 3.0
+                              + y4 / 4.0
+                              + y5 / 5.0
+                              + y6 / 6.0
+                              + y7 / 7.0
+           in (intToDecimal (k + 1)) * ln2 - taylor
+
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- SQUARE ROOT: √x
+-- ═══════════════════════════════════════════════════════════════════════════
+
+-- | Compute √x using 2^k decomposition + Newton-Raphson.
+--
+--   Algorithm (same as Solidity TMaths.sqrt):
+--     1. Find k such that ratio = x / 2^k ∈ [1.0, 2.0)  (k even)
+--        or ratio = 2^k / x ∈ [1.0, 2.0)  (k odd)
+--     2. Newton-Raphson: y_{n+1} = (y_n + ratio/y_n) / 2
+--        Initial guess: 1.5 (midpoint of [1,2])
+--        4 iterations → full convergence for Decimal precision
+--     3. Recompose: √x = 2^(k/2) · √ratio  (or inverse)
+--
+--   Simplified for Daml: we use findK directly, then:
+--     √x = √m · 2^(k/2)  where m ∈ [1.0, 2.0)
+--   If k is odd, adjust: √x = √(2m) · 2^((k-1)/2)
+--
+--   PRECISION NOTE:
+--     Newton-Raphson converges quadratically — 4 iterations gives ~16 correct
+--     digits, exceeding Daml Decimal's 10-digit fractional precision.
+--     This is the best-preserved function: expect ~1-5 bps error vs Solidity's ~0.
+tSqrt : Decimal -> Decimal
+tSqrt x
+  | x < 0.0   = error "TMaths.tSqrt: input must be non-negative"
+  | x == 0.0   = 0.0
+  | x == 1.0   = 1.0
+  | otherwise  =
+      let
+        -- Step 1: decompose x = m * 2^k where m ∈ [1.0, 2.0)
+        (k, m) = findK x
+
+        -- Step 2: if k is odd, absorb one factor of 2 into m
+        -- so we always take sqrt of 2^(even) = exact power of 2
+        (kAdj, mAdj) = if k % 2 /= 0
+                        then (k - 1, m * 2.0)   -- mAdj ∈ [2.0, 4.0)
+                        else (k, m)              -- mAdj ∈ [1.0, 2.0)
+
+        -- Step 3: Newton-Raphson for √mAdj
+        -- Initial guess: 1.5 for [1,2), 2.0 for [2,4)
+        guess : Decimal = if mAdj >= 2.0 then 1.7 else 1.3
+
+        -- 4 iterations (quadratic convergence → ~16 digits, exceeds Decimal's 10)
+        nr1 : Decimal = (guess + mAdj / guess) / 2.0
+        nr2 : Decimal = (nr1 + mAdj / nr1) / 2.0
+        nr3 : Decimal = (nr2 + mAdj / nr2) / 2.0
+        nr4 : Decimal = (nr3 + mAdj / nr3) / 2.0
+
+        -- Step 4: recompose √x = √mAdj · 2^(kAdj/2)
+        halfK : Int = kAdj / 2
+
+      in nr4 * pow2 halfK
+
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- ABS helper
+-- ═══════════════════════════════════════════════════════════════════════════
+
+tAbs : Decimal -> Decimal
+tAbs x = if x < 0.0 then negate x else x

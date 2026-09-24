@@ -2,12 +2,17 @@
 // © 2025 Tokenisys. All rights reserved.
 pragma solidity ^0.8.31;
 
-/// @title TMaths - Gas-efficient mathematical functions in assembly
+/// @title TMathFusaka - Gas-efficient mathematical functions in assembly
 /// @notice All values scaled by 1e18 (PRECISION)
-/// @dev Uses 2^k decomposition + Taylor/Newton-Raphson for optimal gas and accuracy
-library TMaths {
+/// @dev Uses 2^k decomposition + Taylor/Newton-Raphson for optimal gas and accuracy.
+///      Uses the EIP-7939 `clz` opcode (Fusaka hardfork, activated on Ethereum
+///      mainnet 3 December 2025; Arbitrum ArbOS 51 "Dia" 8 January 2026).
+///      For chains that have not yet activated Fusaka (e.g. Base, OP Mainnet,
+///      Unichain as of May 2026), use TMathLegacy.sol instead.
+library TMathFusaka {
     error ZeroInput();
     error ExponentTooLarge();
+    error Undefined();
 
     // ═══════════════════════════════════════════════════════════════════════════
     // EXPONENTIAL
@@ -45,30 +50,24 @@ library TMaths {
                 // r = exponent - k * LN2
                 let r := sub(exponent, mul(k, 693147180559945309))
 
-                // Taylor series for e^r (unrolled, 6 terms)
+                // Taylor series for e^r via scaled-integer Horner, 6 terms.
+                // 720·e^r ≈ 720 + r·(720 + r·(360 + r·(120 + r·(30 + r·(6 + r)))))
+                // Coefficients are LCM(1..6)=720 scaled; final divide by 720 unscales.
+                // Worst-case relative error ~8.3e-6 over r in [0, ln2).
                 switch iszero(r)
                 case 1 {
                     result := 1000000000000000000
                 }
                 default {
-                    // Start with 1 + r
-                    result := add(1000000000000000000, r)
-                    
-                    // term = r² / 2
-                    let term := div(mul(r, r), 1000000000000000000)
-                    result := add(result, div(term, 2))
-                    
-                    // term = r³ / 6
-                    term := div(mul(term, r), 1000000000000000000)
-                    result := add(result, div(term, 6))
-                    
-                    // term = r⁴ / 24
-                    term := div(mul(term, r), 1000000000000000000)
-                    result := add(result, div(term, 24))
-                    
-                    // term = r⁵ / 120
-                    term := div(mul(term, r), 1000000000000000000)
-                    result := add(result, div(term, 120))
+                    // p folds the first Horner step (1*r + 6) since the
+                    // leading r⁶ coefficient is 1.
+                    let p := add(6000000000000000000, r)
+                    p := add(30000000000000000000, div(mul(p, r), 1000000000000000000))
+                    p := add(120000000000000000000, div(mul(p, r), 1000000000000000000))
+                    p := add(360000000000000000000, div(mul(p, r), 1000000000000000000))
+                    p := add(720000000000000000000, div(mul(p, r), 1000000000000000000))
+                    p := add(720000000000000000000, div(mul(p, r), 1000000000000000000))
+                    result := div(p, 720)
                 }
 
                 // Multiply by 2^k
@@ -158,53 +157,44 @@ library TMaths {
                     addTaylor := 0
                 }
 
-                // Taylor series
+                // Taylor series via scaled-integer Horner, 10 terms.
+                // taylor = x * P(x) / 2520, P the inner polynomial.
+                // Coefficients are LCM(1..10)=2520 scaled.
+                // add-branch P has alternating signs, so p goes negative
+                // mid-evaluation: sdiv is mandatory (unsigned div would
+                // misread a negative p as ~2**256).
+                // Worst-case relative error ~7.5e-5 at the x=0.5 boundary.
                 let taylor := 0
-                
+
                 switch addTaylor
                 case 1 {
-                    // ln(1+x) = x - x²/2 + x³/3 - x⁴/4 + x⁵/5 - x⁶/6 + x⁷/7
-                    taylor := x
-
-                    let term := div(mul(x, x), precision)
-                    taylor := sub(taylor, div(term, 2))
-
-                    term := div(mul(term, x), precision)
-                    taylor := add(taylor, div(term, 3))
-
-                    term := div(mul(term, x), precision)
-                    taylor := sub(taylor, div(term, 4))
-
-                    term := div(mul(term, x), precision)
-                    taylor := add(taylor, div(term, 5))
-
-                    term := div(mul(term, x), precision)
-                    taylor := sub(taylor, div(term, 6))
-
-                    term := div(mul(term, x), precision)
-                    taylor := add(taylor, div(term, 7))
+                    // ln(1+x): P(x) = 2520 - 1260x + 840x2 - 630x3 + 504x4
+                    //                 - 420x5 + 360x6 - 315x7 + 280x8 - 252x9
+                    let p := sub(280000000000000000000, mul(252, x))
+                    p := add(sub(0, 315000000000000000000), sdiv(mul(p, x), precision))
+                    p := add(360000000000000000000, sdiv(mul(p, x), precision))
+                    p := add(sub(0, 420000000000000000000), sdiv(mul(p, x), precision))
+                    p := add(504000000000000000000, sdiv(mul(p, x), precision))
+                    p := add(sub(0, 630000000000000000000), sdiv(mul(p, x), precision))
+                    p := add(840000000000000000000, sdiv(mul(p, x), precision))
+                    p := add(sub(0, 1260000000000000000000), sdiv(mul(p, x), precision))
+                    p := add(2520000000000000000000, sdiv(mul(p, x), precision))
+                    taylor := sdiv(mul(x, p), 2520000000000000000000)
                 }
                 default {
-                    // ln(1-x) = -x - x²/2 - x³/3 - x⁴/4 - ... (all terms same sign)
-                    taylor := x
-
-                    let term := div(mul(x, x), precision)
-                    taylor := add(taylor, div(term, 2))
-
-                    term := div(mul(term, x), precision)
-                    taylor := add(taylor, div(term, 3))
-
-                    term := div(mul(term, x), precision)
-                    taylor := add(taylor, div(term, 4))
-
-                    term := div(mul(term, x), precision)
-                    taylor := add(taylor, div(term, 5))
-
-                    term := div(mul(term, x), precision)
-                    taylor := add(taylor, div(term, 6))
-
-                    term := div(mul(term, x), precision)
-                    taylor := add(taylor, div(term, 7))
+                    // -ln(1-x): P(x) = 2520 + 1260x + 840x2 + 630x3 + 504x4
+                    //                  + 420x5 + 360x6 + 315x7 + 280x8 + 252x9
+                    // All terms positive: div is sufficient.
+                    let p := add(280000000000000000000, mul(252, x))
+                    p := add(315000000000000000000, div(mul(p, x), precision))
+                    p := add(360000000000000000000, div(mul(p, x), precision))
+                    p := add(420000000000000000000, div(mul(p, x), precision))
+                    p := add(504000000000000000000, div(mul(p, x), precision))
+                    p := add(630000000000000000000, div(mul(p, x), precision))
+                    p := add(840000000000000000000, div(mul(p, x), precision))
+                    p := add(1260000000000000000000, div(mul(p, x), precision))
+                    p := add(2520000000000000000000, div(mul(p, x), precision))
+                    taylor := div(mul(x, p), 2520000000000000000000)
                 }
 
                 // result = k * ln(2) +/- taylor
@@ -398,6 +388,13 @@ library TMaths {
                     // Convert theta to radians (multiply by π/4)
                     theta := div(mul(theta, PI_4), precision)
 
+                    // Reduce r_x into 1-8: trig period is 8 octants. For
+                    // x >= 2*PI the raw octant index runs past 8 (9, 13,
+                    // 17, ...); without this the sign mask and Taylor
+                    // selection shift past their bit patterns. Must come
+                    // after theta is computed (theta uses the raw index).
+                    r_x := add(mod(sub(r_x, 1), 8), 1)
+
                     // Determine sign using bit patterns
                     let mask := shl(sub(r_x, 1), 1)
                     let signing := 195  // cos: 11000011
@@ -478,6 +475,8 @@ library TMaths {
         (uint256 sinVal, bool sinSign) = trig(x, false);
         (uint256 cosVal, bool cosSign) = trig(x, true);
         
+        // tan is undefined where cos(x) = 0 (odd multiples of PI/2)
+        if (cosVal == 0) revert Undefined();
         // tan = sin / cos
         result = (sinVal * 1e18) / cosVal;
         // Sign: positive if both same sign, negative if different

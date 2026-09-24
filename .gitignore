@@ -7,3 +7,8 @@
 
 # Foundry lock (optional - some prefer to commit this)
 foundry.lock
+
+# Build output under the May layout
+solidity/out/
+solidity/cache/
+.daml/

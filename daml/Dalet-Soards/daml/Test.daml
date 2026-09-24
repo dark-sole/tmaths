@@ -1,0 +1,164 @@
+module Test where
+
+import TMaths
+import Daml.Script
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- TMaths Test Suite
+-- ═══════════════════════════════════════════════════════════════════════════
+
+-- | Helper: check result is within tolerance, trace output always
+assertApprox : Text -> Decimal -> Decimal -> Decimal -> Script ()
+assertApprox label expected actual tolerance = do
+  let diff = tAbs (actual - expected)
+  let pctErr = if tAbs expected > 0.0000000001
+               then (diff / tAbs expected) * 100.0
+               else 0.0
+  let ok = diff <= tolerance
+  let msg = label
+        <> " | exp=" <> show expected
+        <> " | act=" <> show actual
+        <> " | diff=" <> show diff
+        <> " | err%=" <> show pctErr
+        <> " | " <> (if ok then "PASS" else "FAIL")
+  trace msg $ pure ()
+  assertMsg msg ok
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- EXP tests
+-- ═══════════════════════════════════════════════════════════════════════════
+
+testExp : Script ()
+testExp = do
+  trace "=== EXP TESTS ===" $ pure ()
+
+  -- e^0 = 1 (exact)
+  assertApprox "exp(0)" 1.0 (tExp 0.0) 0.0
+
+  -- e^1 = 2.718281828459045...
+  assertApprox "exp(1)" 2.7182818285 (tExp 1.0) 0.001
+
+  -- e^(-1) = 0.367879441171442...
+  assertApprox "exp(-1)" 0.3678794412 (tExp (-1.0)) 0.001
+
+  -- e^0.5 = 1.648721270700128...
+  assertApprox "exp(0.5)" 1.6487212707 (tExp 0.5) 0.001
+
+  -- e^2 = 7.389056098930650...
+  assertApprox "exp(2)" 7.3890560989 (tExp 2.0) 0.01
+
+  -- e^(-2) = 0.135335283236613...
+  assertApprox "exp(-2)" 0.1353352832 (tExp (-2.0)) 0.01
+
+  -- e^5 = 148.413159102576603...
+  assertApprox "exp(5)" 148.4131591026 (tExp 5.0) 0.1
+
+  -- e^0.05 = 1.051271096376024... (typical rT)
+  assertApprox "exp(0.05)" 1.0512710964 (tExp 0.05) 0.0001
+
+  -- e^(-0.05) = 0.951229424500714... (typical discount)
+  assertApprox "exp(-0.05)" 0.9512294245 (tExp (-0.05)) 0.0001
+
+  trace "=== EXP TESTS COMPLETE ===" $ pure ()
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- LN tests
+-- ═══════════════════════════════════════════════════════════════════════════
+
+testLn : Script ()
+testLn = do
+  trace "=== LN TESTS ===" $ pure ()
+
+  -- ln(1) = 0 (exact)
+  assertApprox "ln(1)" 0.0 (tLn 1.0) 0.0
+
+  -- ln(2) = 0.693147180559945...
+  assertApprox "ln(2)" 0.6931471806 (tLn 2.0) 0.001
+
+  -- ln(0.5) = -0.693147180559945...
+  assertApprox "ln(0.5)" (-0.6931471806) (tLn 0.5) 0.001
+
+  -- ln(e) ≈ 1.0
+  assertApprox "ln(e)" 1.0 (tLn 2.7182818285) 0.01
+
+  -- ln(10) = 2.302585092994046...
+  assertApprox "ln(10)" 2.3025850930 (tLn 10.0) 0.01
+
+  -- ln(100) = 4.605170185988091...
+  assertApprox "ln(100)" 4.6051701860 (tLn 100.0) 0.01
+
+  -- ln(1.1) = 0.095310179804324... (near ATM)
+  assertApprox "ln(1.1)" 0.0953101798 (tLn 1.1) 0.001
+
+  -- ln(0.9) = -0.105360515657826... (near ATM)
+  assertApprox "ln(0.9)" (-0.1053605157) (tLn 0.9) 0.001
+
+  trace "=== LN TESTS COMPLETE ===" $ pure ()
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- SQRT tests
+-- ═══════════════════════════════════════════════════════════════════════════
+
+testSqrt : Script ()
+testSqrt = do
+  trace "=== SQRT TESTS ===" $ pure ()
+
+  -- √1 = 1 (exact)
+  assertApprox "sqrt(1)" 1.0 (tSqrt 1.0) 0.0
+
+  -- √4 = 2 (exact)
+  assertApprox "sqrt(4)" 2.0 (tSqrt 4.0) 0.0000000001
+
+  -- √2 = 1.414213562373095...
+  assertApprox "sqrt(2)" 1.4142135624 (tSqrt 2.0) 0.0000000001
+
+  -- √0.25 = 0.5 (typical T = 3 months)
+  assertApprox "sqrt(0.25)" 0.5 (tSqrt 0.25) 0.0000000001
+
+  -- √0.5 = 0.707106781186547...
+  assertApprox "sqrt(0.5)" 0.7071067812 (tSqrt 0.5) 0.0000000001
+
+  -- √100 = 10
+  assertApprox "sqrt(100)" 10.0 (tSqrt 100.0) 0.0000000001
+
+  -- √0.01 = 0.1
+  assertApprox "sqrt(0.01)" 0.1 (tSqrt 0.01) 0.0000000001
+
+  -- √3 = 1.732050808...
+  assertApprox "sqrt(3)" 1.7320508076 (tSqrt 3.0) 0.0000000001
+
+  trace "=== SQRT TESTS COMPLETE ===" $ pure ()
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Roundtrip tests
+-- ═══════════════════════════════════════════════════════════════════════════
+
+testRoundtrip : Script ()
+testRoundtrip = do
+  trace "=== ROUNDTRIP TESTS ===" $ pure ()
+
+  let rt1 = tExp (tLn 2.0)
+  assertApprox "exp(ln(2))" 2.0 rt1 0.01
+
+  let rt2 = tLn (tExp 1.0)
+  assertApprox "ln(exp(1))" 1.0 rt2 0.01
+
+  let s = tSqrt 7.0
+  assertApprox "sqrt(7)^2" 7.0 (s * s) 0.0000001
+
+  let rt3 = tExp (tLn 0.5)
+  assertApprox "exp(ln(0.5))" 0.5 rt3 0.01
+
+  trace "=== ROUNDTRIP TESTS COMPLETE ===" $ pure ()
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Run all
+-- ═══════════════════════════════════════════════════════════════════════════
+
+testAll : Script ()
+testAll = do
+  testExp
+  testLn
+  testSqrt
+  testRoundtrip
+  trace "=== ALL TMATHS TESTS PASSED ===" $ pure ()

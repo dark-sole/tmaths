@@ -1,0 +1,211 @@
+-- Copyright © 2025 Tokenisys (The Dark Sole Enterprise Ltd). All rights reserved.
+--
+-- DaletCDF: Dalet distribution cumulative distribution function
+--
+-- Ports DaletCDF.sol to Daml. The Dalet distribution is Student-t with ν=2,
+-- derived from angular parameters of the implied tangent.
+--
+-- CDF: Φ_D(x) = (1 + x/√(1+x²)) / 2
+--
+-- Properties:
+--   - Heavier tails than Normal, lighter than Cauchy
+--   - Symmetric around x=0: Φ_D(0) = 0.5
+--   - Closed-form CDF — no series approximation needed (unlike Normal)
+--   - Single sqrt call per evaluation
+--
+-- Applications:
+--   - Option pricing (DaletOption) — tail probability for exercise threshold
+--   - Value at Risk (VaR) — quantile function via inverse CDF
+--   - Conditional VaR / Expected Shortfall
+--   - Risk-adjusted return distributions
+--   - Any application requiring fat-tailed probability estimates
+--
+-- PRECISION NOTE:
+--   The CDF itself is well-conditioned — just one sqrt and one division.
+--   Precision loss is minimal here compared to the Taylor-based functions
+--   in TMaths. The main degradation occurs when this feeds into further
+--   calculations (e.g., survival × forward in option pricing).
+
+module DaletCDF where
+
+import TMaths
+
+-- | Dalet CDF: Φ_D(x) = (1 + x/√(1+x²)) / 2
+--
+--   Input: any real number x (as Decimal)
+--   Output: probability in [0, 1]
+--
+--   The computation is:
+--     sinθ = x / √(1 + x²)     — sin(arctan(x))
+--     Φ_D(x) = (1 + sinθ) / 2
+--
+--   This is the "fast" path from DaletCDF.sol (daletCdfFast).
+--   Single sqrt call, no series approximation.
+daletCdf : Decimal -> Decimal
+daletCdf x
+  | x == 0.0  = 0.5
+  | otherwise =
+      let
+        sqrtDenom : Decimal = tSqrt (1.0 + x * x)
+        sinTheta : Decimal = x / sqrtDenom
+      in (1.0 + sinTheta) / 2.0
+
+-- | Dalet survival function: 1 - Φ_D(x)
+--   Equivalent to Φ_D(-x) by symmetry.
+--   Used directly in option pricing for tail probability.
+daletSurvival : Decimal -> Decimal
+daletSurvival x = 1.0 - daletCdf x
+
+-- | Dalet PDF: φ_D(x) = 1 / (2·(1+x²)^(3/2))
+--   Useful for density-weighted integrals and risk analytics.
+--
+--   Derived from: d/dx [(1 + x/√(1+x²)) / 2] = 1 / (2·(1+x²)^(3/2))
+daletPdf : Decimal -> Decimal
+daletPdf x =
+  let
+    denom : Decimal = 1.0 + x * x
+    sqrtDenom : Decimal = tSqrt denom
+  in 1.0 / (2.0 * denom * sqrtDenom)
+
+-- | Dalet density integral: ∫_{x*}^∞ t·φ_D(t)dt = cos(θ*)/2 = 1/(2·√(1+x²))
+--   This is NOT the PDF evaluated at x — it's the integral of t·φ(t).
+--   Used in option pricing for the expected value contribution above threshold.
+daletDensityIntegral : Decimal -> Decimal
+daletDensityIntegral x =
+  let
+    sqrtDenom : Decimal = tSqrt (1.0 + x * x)
+  in 1.0 / (2.0 * sqrtDenom)
+
+-- | Dalet quantile (inverse CDF): given p ∈ (0,1), find x such that Φ_D(x) = p
+--
+--   From Φ_D(x) = (1 + x/√(1+x²)) / 2 = p:
+--     x/√(1+x²) = 2p - 1
+--     Let u = 2p - 1, then x² = u²·(1+x²), so x² = u²/(1-u²)
+--     x = u / √(1 - u²)
+--
+--   This is exact — no Newton-Raphson iteration needed.
+--   Useful for VaR: VaR_p = μ + σ · daletQuantile(p)
+daletQuantile : Decimal -> Decimal
+daletQuantile p
+  | p <= 0.0  = error "DaletCDF.daletQuantile: p must be in (0,1)"
+  | p >= 1.0  = error "DaletCDF.daletQuantile: p must be in (0,1)"
+  | p == 0.5  = 0.0
+  | otherwise =
+      let
+        u : Decimal = 2.0 * p - 1.0
+        -- x = u / √(1 - u²)
+        -- For p near 0 or 1, u² approaches 1 and 1-u² approaches 0,
+        -- causing division by near-zero. Daml Decimal handles this
+        -- up to its precision limit.
+      in u / tSqrt (1.0 - u * u)
+
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- RISK MEASURES: VaR and CVaR
+-- ═══════════════════════════════════════════════════════════════════════════
+
+-- | Value at Risk under the Dalet distribution.
+--
+--   VaR_α(μ, σ) = μ + σ · Q(1 - α)
+--
+--   where α is the confidence level (e.g. 0.95 or 0.99)
+--   and Q is the Dalet quantile function.
+--
+--   Returns the loss threshold: with probability α, the loss will
+--   not exceed this value. The result is in the same units as μ and σ.
+--
+--   Convention: positive VaR means a loss. If portfolio return is
+--   modelled as X ~ Dalet(μ, σ), then VaR is the negative quantile
+--   of the loss distribution:
+--     VaR_α = -(μ + σ · Q(1 - α))
+--
+--   We return the raw threshold (not negated) — the caller decides
+--   sign convention based on their risk framework.
+--
+--   Inputs:
+--     mu         - expected return (e.g. 0.0 for zero-mean)
+--     sigma      - volatility / scale parameter
+--     confidence - confidence level ∈ (0, 1), typically 0.95 or 0.99
+--
+--   Example: daletVaR 0.0 0.02 0.95
+--     = 0.0 + 0.02 · Q(0.05)
+--     = 0.02 · (-2.0647416046)
+--     = -0.0412948321
+--   Interpretation: 95% VaR is 4.13% loss
+daletVaR : Decimal -> Decimal -> Decimal -> Decimal
+daletVaR mu sigma confidence
+  | confidence <= 0.0 = error "DaletCDF.daletVaR: confidence must be in (0,1)"
+  | confidence >= 1.0 = error "DaletCDF.daletVaR: confidence must be in (0,1)"
+  | sigma < 0.0       = error "DaletCDF.daletVaR: sigma must be non-negative"
+  | otherwise =
+      let
+        q : Decimal = daletQuantile (1.0 - confidence)
+      in mu + sigma * q
+
+
+-- | Conditional Value at Risk (Expected Shortfall) under Dalet distribution.
+--
+--   CVaR_α(μ, σ) = μ + σ · E[X | X < Q(1-α)]
+--
+--   where the conditional tail expectation for the Dalet distribution is:
+--
+--     E[X | X < q] = -∫_{q}^{∞} t·φ_D(t)dt / Φ_D(q)
+--                   = -daletDensityIntegral(q) / daletCdf(q)
+--
+--   Since Φ_D(Q(1-α)) = 1-α by definition:
+--
+--     E[X | X < Q(1-α)] = -daletDensityIntegral(Q(1-α)) / (1 - α)
+--
+--   CVaR is always more conservative than VaR (larger loss estimate)
+--   because it averages over the entire tail beyond the VaR threshold.
+--
+--   Derivation:
+--     The Dalet PDF is φ_D(x) = 1/(2(1+x²)^{3/2})
+--     ∫_{-∞}^{q} t·φ_D(t)dt = -1/(2√(1+q²)) by direct integration
+--     (using the fact that ∫_{-∞}^{∞} t·φ_D(t)dt = 0 for this symmetric dist)
+--     So E[X | X < q] = [-1/(2√(1+q²))] / Φ_D(q)
+--
+--   Inputs:
+--     mu         - expected return
+--     sigma      - volatility / scale parameter
+--     confidence - confidence level ∈ (0, 1), typically 0.95 or 0.99
+--
+--   Example: daletCVaR 0.0 0.02 0.95
+--     q = Q(0.05) = -2.0647416046
+--     densityInt = 1/(2·√(1 + q²)) = 1/(2·√(5.2632...)) = 0.2179...
+--     tailExpectation = -0.2179... / 0.05 = -4.3588...
+--     CVaR = 0.0 + 0.02 · (-4.3588...) = -0.0872...
+--   Interpretation: 95% CVaR is ~8.72% loss (vs 4.13% for VaR)
+daletCVaR : Decimal -> Decimal -> Decimal -> Decimal
+daletCVaR mu sigma confidence
+  | confidence <= 0.0 = error "DaletCDF.daletCVaR: confidence must be in (0,1)"
+  | confidence >= 1.0 = error "DaletCDF.daletCVaR: confidence must be in (0,1)"
+  | sigma < 0.0       = error "DaletCDF.daletCVaR: sigma must be non-negative"
+  | otherwise =
+      let
+        alpha : Decimal = 1.0 - confidence  -- tail probability
+        q : Decimal = daletQuantile alpha
+        -- E[X | X < q] = -densityIntegral(q) / Φ_D(q)
+        -- Since Φ_D(q) = alpha, we simplify:
+        tailExpectation : Decimal = negate (daletDensityIntegral q) / alpha
+      in mu + sigma * tailExpectation
+
+
+-- | Risk result record for structured output
+data RiskResult = RiskResult
+  with
+    var95  : Decimal   -- 95% VaR
+    var99  : Decimal   -- 99% VaR
+    cvar95 : Decimal   -- 95% CVaR (Expected Shortfall)
+    cvar99 : Decimal   -- 99% CVaR (Expected Shortfall)
+  deriving (Show, Eq)
+
+-- | Compute all standard risk measures in one call.
+--   Returns VaR and CVaR at 95% and 99% confidence levels.
+daletRisk : Decimal -> Decimal -> RiskResult
+daletRisk mu sigma = RiskResult
+  { var95  = daletVaR mu sigma 0.95
+  , var99  = daletVaR mu sigma 0.99
+  , cvar95 = daletCVaR mu sigma 0.95
+  , cvar99 = daletCVaR mu sigma 0.99
+  }

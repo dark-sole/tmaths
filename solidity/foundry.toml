@@ -5,6 +5,8 @@ libs = ["lib"]
 solc = "0.8.31"
 auto_detect_solc = false
 evm_version = "osaka"
+via_ir = true
+optimizer = true
 
 [fuzz]
 runs = 256

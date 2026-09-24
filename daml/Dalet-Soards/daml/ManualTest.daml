@@ -1,0 +1,50 @@
+module ManualTest where
+
+import TMaths
+import Daml.Script
+
+-- Deliberately fail with computed values in the error message
+testShowValues : Script ()
+testShowValues = do
+  let e1  = tExp 1.0
+  let e05 = tExp 0.5
+  let em1 = tExp (-1.0)
+  let e5  = tExp 5.0
+  let e005 = tExp 0.05
+  let em005 = tExp (-0.05)
+
+  let l2   = tLn 2.0
+  let l05  = tLn 0.5
+  let l10  = tLn 10.0
+  let l11  = tLn 1.1
+  let l09  = tLn 0.9
+
+  let s2   = tSqrt 2.0
+  let s025 = tSqrt 0.25
+  let s05  = tSqrt 0.5
+  let s3   = tSqrt 3.0
+
+  let rt1  = tExp (tLn 2.0)
+  let rt2  = tLn (tExp 1.0)
+  let s7   = tSqrt 7.0
+
+  assertMsg ("RESULTS:"
+    <> "\n  exp(1)=" <> show e1
+    <> "\n  exp(0.5)=" <> show e05
+    <> "\n  exp(-1)=" <> show em1
+    <> "\n  exp(5)=" <> show e5
+    <> "\n  exp(0.05)=" <> show e005
+    <> "\n  exp(-0.05)=" <> show em005
+    <> "\n  ln(2)=" <> show l2
+    <> "\n  ln(0.5)=" <> show l05
+    <> "\n  ln(10)=" <> show l10
+    <> "\n  ln(1.1)=" <> show l11
+    <> "\n  ln(0.9)=" <> show l09
+    <> "\n  sqrt(2)=" <> show s2
+    <> "\n  sqrt(0.25)=" <> show s025
+    <> "\n  sqrt(0.5)=" <> show s05
+    <> "\n  sqrt(3)=" <> show s3
+    <> "\n  exp(ln(2))=" <> show rt1
+    <> "\n  ln(exp(1))=" <> show rt2
+    <> "\n  sqrt(7)^2=" <> show (s7 * s7)
+    ) False

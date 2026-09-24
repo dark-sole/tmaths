@@ -1,0 +1,239 @@
+-- Copyright © 2025 Tokenisys (The Dark Sole Enterprise Ltd). All rights reserved.
+--
+-- PricingService: On-chain European option pricer using Dalet distribution
+--
+-- A Canton smart contract that computes option prices on-ledger.
+-- Each pricing request generates a transaction on the Canton Network:
+--   - Archives the service contract (consuming choice)
+--   - Creates a PricingResult (auditable, immutable record)
+--   - Re-creates the PricingService (ready for next request)
+--
+-- This produces real transaction volume on a validator node and
+-- demonstrates on-chain quantitative computation — including the
+-- precision limitations that Fortress is designed to address.
+
+module PricingService where
+
+import DaletOption
+import DaletCDF
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- PRICING SERVICE
+-- ═══════════════════════════════════════════════════════════════════════════
+
+-- | Persistent service contract. Each RequestPrice exercises (archives)
+--   this contract and creates a fresh one, generating a transaction.
+template PricingService
+  with
+    operator : Party   -- Runs the pricing service
+    client   : Party   -- Can request prices
+  where
+    signatory operator
+    observer client
+
+    -- | Price a European option using the Dalet distribution.
+    --   Consuming choice: generates a transaction on the ledger.
+    --   Creates a PricingResult record and a fresh PricingService.
+    choice RequestPrice : (ContractId PricingResult, ContractId PricingService)
+      with
+        spot      : Decimal  -- Current spot price
+        strike    : Decimal  -- Strike price
+        timeToExp : Decimal  -- Time to expiry in years
+        rate      : Decimal  -- Risk-free rate (e.g. 0.05)
+        vol       : Decimal  -- Volatility (e.g. 0.20)
+        ref       : Text     -- Reference/underlying identifier
+      controller client
+      do
+        assertMsg "Spot must be positive" (spot > 0.0)
+        assertMsg "Strike must be positive" (strike > 0.0)
+        assertMsg "Time must be positive" (timeToExp > 0.0)
+        assertMsg "Vol must be positive" (vol > 0.0)
+
+        -- Run the Dalet pricer on-chain
+        let result = daletPrice spot strike timeToExp rate vol
+
+        -- Create immutable pricing result (both parties sign)
+        resultCid <- create PricingResult with
+          operator
+          client
+          ref
+          spot
+          strike
+          timeToExp
+          rate
+          vol
+          callPrice  = result.callPrice
+          putPrice   = result.putPrice
+          deltaCall  = result.deltaCalls
+          deltaPut   = result.deltaPut
+
+        -- Re-create the service for the next request
+        serviceCid <- create PricingService with operator; client
+
+        return (resultCid, serviceCid)
+
+    -- | Compute the Dalet CDF — useful for VaR and risk analytics.
+    --   Also a consuming choice for transaction generation.
+    choice RequestCDF : (ContractId CDFResult, ContractId PricingService)
+      with
+        xValue : Decimal  -- Input value
+        ref    : Text     -- Reference identifier
+      controller client
+      do
+        let cdf      = daletCdf xValue
+        let surv     = daletSurvival xValue
+        let pdf      = daletPdf xValue
+        let density  = daletDensityIntegral xValue
+
+        resultCid <- create CDFResult with
+          operator
+          client
+          ref
+          xValue
+          cdf
+          survival = surv
+          pdf
+          densityIntegral = density
+
+        serviceCid <- create PricingService with operator; client
+
+        return (resultCid, serviceCid)
+
+    -- | Compute VaR and CVaR at 95% and 99% confidence levels.
+    --   Consuming choice for transaction generation.
+    choice RequestRisk : (ContractId RiskResultContract, ContractId PricingService)
+      with
+        mu    : Decimal  -- Expected return (e.g. 0.0)
+        sigma : Decimal  -- Volatility / scale (e.g. 0.02 = 2% daily)
+        ref   : Text     -- Reference identifier
+      controller client
+      do
+        assertMsg "Sigma must be positive" (sigma > 0.0)
+
+        let risk = daletRisk mu sigma
+
+        resultCid <- create RiskResultContract with
+          operator
+          client
+          ref
+          mu
+          sigma
+          var95  = risk.var95
+          var99  = risk.var99
+          cvar95 = risk.cvar95
+          cvar99 = risk.cvar99
+
+        serviceCid <- create PricingService with operator; client
+
+        return (resultCid, serviceCid)
+
+    -- | Operator can terminate the service
+    choice TerminateService : ()
+      controller operator
+      do
+        return ()
+
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- PRICING RESULT — immutable on-chain record
+-- ═══════════════════════════════════════════════════════════════════════════
+
+-- | Auditable record of an option pricing computation.
+--   Both operator and client are signatories — neither can
+--   unilaterally create or tamper with results.
+template PricingResult
+  with
+    operator   : Party
+    client     : Party
+    ref        : Text      -- Underlying reference
+    spot       : Decimal
+    strike     : Decimal
+    timeToExp  : Decimal
+    rate       : Decimal
+    vol        : Decimal
+    callPrice  : Decimal
+    putPrice   : Decimal
+    deltaCall  : Decimal
+    deltaPut   : Decimal
+  where
+    signatory operator, client
+
+    -- Client can archive when no longer needed
+    choice AcknowledgePrice : ()
+      controller client
+      do return ()
+
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- CDF RESULT — immutable on-chain record
+-- ═══════════════════════════════════════════════════════════════════════════
+
+-- | Auditable record of a Dalet CDF computation.
+template CDFResult
+  with
+    operator        : Party
+    client          : Party
+    ref             : Text
+    xValue          : Decimal
+    cdf             : Decimal
+    survival        : Decimal
+    pdf             : Decimal
+    densityIntegral : Decimal
+  where
+    signatory operator, client
+
+    choice AcknowledgeCDF : ()
+      controller client
+      do return ()
+
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- RISK RESULT — immutable on-chain record
+-- ═══════════════════════════════════════════════════════════════════════════
+
+-- | Auditable record of a VaR/CVaR risk computation.
+template RiskResultContract
+  with
+    operator : Party
+    client   : Party
+    ref      : Text
+    mu       : Decimal   -- Expected return input
+    sigma    : Decimal   -- Volatility input
+    var95    : Decimal   -- 95% Value at Risk
+    var99    : Decimal   -- 99% Value at Risk
+    cvar95   : Decimal   -- 95% Conditional VaR (Expected Shortfall)
+    cvar99   : Decimal   -- 99% Conditional VaR (Expected Shortfall)
+  where
+    signatory operator, client
+
+    choice AcknowledgeRisk : ()
+      controller client
+      do return ()
+
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- SERVICE PROPOSAL — offer/accept to establish the service
+-- ═══════════════════════════════════════════════════════════════════════════
+
+-- | Operator proposes a pricing service to a client.
+--   Standard Canton offer/accept pattern.
+template ServiceProposal
+  with
+    operator : Party
+    client   : Party
+  where
+    signatory operator
+    observer client
+
+    choice AcceptService : ContractId PricingService
+      controller client
+      do
+        create PricingService with operator; client
+
+    choice RejectService : ()
+      controller client
+      do return ()
+
+    choice WithdrawService : ()
+      controller operator
+      do return ()

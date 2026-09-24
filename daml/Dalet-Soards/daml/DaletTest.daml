@@ -1,0 +1,158 @@
+module DaletTest where
+
+import DaletOption
+import DaletCDF
+import Daml.Script
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- DaletOption Test Suite
+--
+-- Tests European option pricing under the Dalet distribution.
+-- Uses assertMsg False to dump computed values (SDK 2.10 workaround).
+-- ═══════════════════════════════════════════════════════════════════════════
+
+-- | Format an OptionResult for display
+showResult : Text -> OptionResult -> Text
+showResult label r =
+  label
+  <> " | call=" <> show r.callPrice
+  <> " | put=" <> show r.putPrice
+  <> " | dC=" <> show r.deltaCalls
+  <> " | dP=" <> show r.deltaPut
+
+-- | Test the Dalet CDF, survival, PDF, and quantile functions
+testCDF : Script ()
+testCDF = do
+  let c0   = daletCdf 0.0
+  let c1   = daletCdf 1.0
+  let cm1  = daletCdf (-1.0)
+  let c2   = daletCdf 2.0
+  let c3   = daletCdf 3.0
+
+  let s1   = daletSurvival 1.0
+  let s2   = daletSurvival 2.0
+
+  let p0   = daletPdf 0.0
+  let p1   = daletPdf 1.0
+
+  let q50  = daletQuantile 0.5
+  let q95  = daletQuantile 0.95
+  let q99  = daletQuantile 0.99
+  let q01  = daletQuantile 0.01
+  let q05  = daletQuantile 0.05
+
+  -- Roundtrip: CDF(quantile(p)) should ≈ p
+  let rt95 = daletCdf (daletQuantile 0.95)
+  let rt01 = daletCdf (daletQuantile 0.01)
+
+  assertMsg ("DALET CDF RESULTS:"
+    <> "\n  CDF(0)=" <> show c0
+    <> "\n  CDF(1)=" <> show c1
+    <> "\n  CDF(-1)=" <> show cm1
+    <> "\n  CDF(2)=" <> show c2
+    <> "\n  CDF(3)=" <> show c3
+    <> "\n  Surv(1)=" <> show s1
+    <> "\n  Surv(2)=" <> show s2
+    <> "\n  PDF(0)=" <> show p0
+    <> "\n  PDF(1)=" <> show p1
+    <> "\n  Q(0.50)=" <> show q50
+    <> "\n  Q(0.95)=" <> show q95
+    <> "\n  Q(0.99)=" <> show q99
+    <> "\n  Q(0.01)=" <> show q01
+    <> "\n  Q(0.05)=" <> show q05
+    <> "\n  CDF(Q(0.95))=" <> show rt95 <> " (expect 0.95)"
+    <> "\n  CDF(Q(0.01))=" <> show rt01 <> " (expect 0.01)"
+    <> "\n  Symmetry: CDF(1)+CDF(-1)=" <> show (c1 + cm1) <> " (expect 1.0)"
+    ) False
+
+-- | Standard ATM option: S=100, K=100, T=0.25 (3 months), r=5%, σ=20%
+-- This is the canonical test case for option pricers.
+testATM : Script ()
+testATM = do
+  let result = daletPrice 100.0 100.0 0.25 0.05 0.20
+  assertMsg (showResult "ATM S=100 K=100 T=0.25 r=5% σ=20%" result) False
+
+-- | ITM call / OTM put: S=100, K=90
+testITM : Script ()
+testITM = do
+  let result = daletPrice 100.0 90.0 0.25 0.05 0.20
+  assertMsg (showResult "ITM S=100 K=90 T=0.25 r=5% σ=20%" result) False
+
+-- | OTM call / ITM put: S=100, K=110
+testOTM : Script ()
+testOTM = do
+  let result = daletPrice 100.0 110.0 0.25 0.05 0.20
+  assertMsg (showResult "OTM S=100 K=110 T=0.25 r=5% σ=20%" result) False
+
+-- | Longer expiry: T=1.0 (1 year)
+testLongExpiry : Script ()
+testLongExpiry = do
+  let result = daletPrice 100.0 100.0 1.0 0.05 0.20
+  assertMsg (showResult "ATM T=1yr S=100 K=100 r=5% σ=20%" result) False
+
+-- | High volatility: σ=50%
+testHighVol : Script ()
+testHighVol = do
+  let result = daletPrice 100.0 100.0 0.25 0.05 0.50
+  assertMsg (showResult "HighVol S=100 K=100 T=0.25 r=5% σ=50%" result) False
+
+-- | Low volatility: σ=5%
+testLowVol : Script ()
+testLowVol = do
+  let result = daletPrice 100.0 100.0 0.25 0.05 0.05
+  assertMsg (showResult "LowVol S=100 K=100 T=0.25 r=5% σ=5%" result) False
+
+-- | Deep OTM call: S=100, K=150 — this is where precision loss is most visible
+testDeepOTM : Script ()
+testDeepOTM = do
+  let result = daletPrice 100.0 150.0 0.25 0.05 0.20
+  assertMsg (showResult "DeepOTM S=100 K=150 T=0.25 r=5% σ=20%" result) False
+
+-- | Deep ITM call: S=100, K=60
+testDeepITM : Script ()
+testDeepITM = do
+  let result = daletPrice 100.0 60.0 0.25 0.05 0.20
+  assertMsg (showResult "DeepITM S=100 K=60 T=0.25 r=5% σ=20%" result) False
+
+-- | Put-call parity check: C - P should ≈ S - K·e^{-rT}
+-- This is model-independent so any deviation is purely numerical error.
+testParity : Script ()
+testParity = do
+  let result = daletPrice 100.0 105.0 0.5 0.05 0.20
+  let cMinusP = result.callPrice - result.putPrice
+  let forward = 100.0 - 105.0 * 0.9753099120  -- pre-computed e^{-0.025}
+  assertMsg ("PARITY S=100 K=105 T=0.5 r=5% σ=20%"
+    <> " | C-P=" <> show cMinusP
+    <> " | S-Ke^rT=" <> show forward
+    <> " | diff=" <> show (cMinusP - forward)
+    ) False
+
+-- | Run all and dump results
+testAllDalet : Script ()
+testAllDalet = do
+  let atm    = daletPrice 100.0 100.0 0.25 0.05 0.20
+  let itm    = daletPrice 100.0 90.0  0.25 0.05 0.20
+  let otm    = daletPrice 100.0 110.0 0.25 0.05 0.20
+  let longT  = daletPrice 100.0 100.0 1.0  0.05 0.20
+  let highV  = daletPrice 100.0 100.0 0.25 0.05 0.50
+  let lowV   = daletPrice 100.0 100.0 0.25 0.05 0.05
+  let deepO  = daletPrice 100.0 150.0 0.25 0.05 0.20
+  let deepI  = daletPrice 100.0 60.0  0.25 0.05 0.20
+
+  let parity = daletPrice 100.0 105.0 0.5  0.05 0.20
+  let cMinusP = parity.callPrice - parity.putPrice
+  let forward = 100.0 - 105.0 * 0.9753099120
+
+  assertMsg ("DALET OPTION RESULTS:"
+    <> "\n  " <> showResult "ATM      " atm
+    <> "\n  " <> showResult "ITM      " itm
+    <> "\n  " <> showResult "OTM      " otm
+    <> "\n  " <> showResult "LongT    " longT
+    <> "\n  " <> showResult "HighVol  " highV
+    <> "\n  " <> showResult "LowVol   " lowV
+    <> "\n  " <> showResult "DeepOTM  " deepO
+    <> "\n  " <> showResult "DeepITM  " deepI
+    <> "\n  PARITY: C-P=" <> show cMinusP
+          <> " | S-Ke^rT=" <> show forward
+          <> " | err=" <> show (cMinusP - forward)
+    ) False

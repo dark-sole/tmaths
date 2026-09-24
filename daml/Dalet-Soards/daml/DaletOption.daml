@@ -1,0 +1,193 @@
+-- Copyright © 2025 Tokenisys (The Dark Sole Enterprise Ltd). All rights reserved.
+--
+-- DaletOption: European option pricing with Dalet distribution on Canton Network
+--
+-- Ports DaletOption.sol to Daml. The Dalet distribution (Student-t, ν=2)
+-- has heavier tails than Normal, giving higher prices for deep OTM options.
+--
+-- All computation stays in log-space where integrals are elementary trigonometric.
+--
+-- Log-space call formula:
+--   C_log = e^{-rT} · [ s·cos(θ*)/2  +  (m + μ) · (1 - Φ_D(x*)) ]
+--
+-- where:
+--   m  = ln(S/K)                — log-moneyness
+--   μ  = (r - σ²/2)·T          — risk-neutral drift
+--   s  = σ·√T                   — volatility-scaled time
+--   x* = -(m + μ)/s            — standardised exercise threshold
+--   cos(θ*)/2 = 1/(2√(1+x*²)) — density integral ∫_{x*}^∞ x·φ_D(x)dx
+--   Φ_D(x) = (1 + x/√(1+x²))/2 — Dalet CDF
+--
+-- Price conversion: C = S · (exp(C_log_norm) - 1)
+-- Put via log-space parity: P_log = C_log - (m + μ) · e^{-rT}
+--
+-- PRECISION NOTE:
+--   This function chains: ln → sqrt → division → multiplication → exp
+--   Each step truncates at Daml's 10-digit Decimal precision.
+--   The compounding error through 5+ operations is where Canton's
+--   precision ceiling becomes most visible vs Solidity's 18 digits.
+--   This is the core demonstration of why Fortress (FortVM) is needed.
+
+module DaletOption where
+
+import TMaths
+import DaletCDF
+
+-- | Result record for option pricing
+data OptionResult = OptionResult
+  with
+    callPrice  : Decimal  -- Call option price in underlying terms
+    putPrice   : Decimal  -- Put option price in underlying terms
+    deltaCalls : Decimal  -- Call delta ∈ [0, 1] (probability of exercise)
+    deltaPut   : Decimal  -- Put delta ∈ [0, 1] (= 1 - deltaCall)
+  deriving (Show, Eq)
+
+-- | Price a European option using the Dalet distribution.
+--
+--   Inputs:
+--     s     - spot price     (e.g. 100.0 = $100)
+--     k     - strike price   (e.g. 110.0 = $110)
+--     t     - time to expiry in years (e.g. 0.25 = 3 months)
+--     r     - risk-free rate as decimal (e.g. 0.05 = 5%)
+--     sigma - volatility as decimal (e.g. 0.20 = 20%)
+--
+--   Outputs: OptionResult with call/put prices and deltas
+daletPrice : Decimal -> Decimal -> Decimal -> Decimal -> Decimal -> OptionResult
+daletPrice s k t r sigma
+  | s <= 0.0     = error "DaletOption: spot must be positive"
+  | k <= 0.0     = error "DaletOption: strike must be positive"
+  | t <= 0.0     = error "DaletOption: time must be positive"
+  | sigma <= 0.0 = error "DaletOption: volatility must be positive"
+  | otherwise =
+      let
+        -- ═══════════════════════════════════════════════════════════════
+        -- Step 1: Core intermediates
+        -- ═══════════════════════════════════════════════════════════════
+
+        -- √T
+        sqrtT : Decimal = tSqrt t
+
+        -- m = ln(S/K) — log-moneyness
+        -- Using native signed Decimal eliminates all the sign-tracking
+        -- assembly from the Solidity version
+        m : Decimal = tLn (s / k)
+
+        -- μ = (r - σ²/2) · T — risk-neutral drift
+        mu : Decimal = (r - sigma * sigma / 2.0) * t
+
+        -- s_vol = σ · √T — volatility-scaled time
+        sVol : Decimal = sigma * sqrtT
+
+        -- m + μ — combined log-forward
+        mPlusMu : Decimal = m + mu
+
+        -- ═══════════════════════════════════════════════════════════════
+        -- Step 2: Standardised exercise threshold
+        --   x* = -(m + μ) / s
+        -- ═══════════════════════════════════════════════════════════════
+
+        xStar : Decimal = negate mPlusMu / sVol
+
+        -- ═══════════════════════════════════════════════════════════════
+        -- Step 3: Dalet CDF and density integral via DaletCDF module
+        --
+        --   survival = 1 - Φ_D(x*)                   — tail probability
+        --   cos(θ*)/2 = 1/(2·√(1+x*²))              — density integral
+        --
+        -- PRECISION NOTE:
+        --   The CDF is well-conditioned (single sqrt + division).
+        --   Precision loss is minimal here compared to the Taylor-based
+        --   functions. Main degradation occurs downstream when these
+        --   feed into further multiplications and exp().
+        -- ═══════════════════════════════════════════════════════════════
+
+        survival : Decimal = daletSurvival xStar
+
+        cosThetaHalf : Decimal = daletDensityIntegral xStar
+
+        -- ═══════════════════════════════════════════════════════════════
+        -- Step 4: Discount factor e^{-rT}
+        -- ═══════════════════════════════════════════════════════════════
+
+        discount : Decimal = tExp (negate (r * t))
+
+        -- ═══════════════════════════════════════════════════════════════
+        -- Step 5: Log-space pricing — always price the OTM side first
+        --
+        -- The log-space formula is most accurate for OTM options (small
+        -- values). The ITM side is derived via put-call parity in
+        -- PRICE-SPACE, which avoids the exp(x)-1 cancellation that
+        -- degrades precision for larger values.
+        --
+        -- Call log-space formula:
+        --   C_log = e^{-rT} · [ s·cos(θ*)/2  +  (m+μ) · survival ]
+        --
+        -- Put log-space formula (by symmetry, using -x*):
+        --   P_log = e^{-rT} · [ s·cos(θ*)/2  -  (m+μ) · (1-survival) ]
+        --         = e^{-rT} · [ s·cos(θ*)/2  -  (m+μ) · Φ_D(x*) ]
+        --   Note: cos(θ*)/2 is symmetric in x*, so density term is same.
+        --
+        -- Price-space put-call parity:
+        --   C - P = S - K·e^{-rT}
+        --   So: C = P + S - K·e^{-rT}
+        --       P = C - S + K·e^{-rT}
+        -- ═══════════════════════════════════════════════════════════════
+
+        densityTerm : Decimal = sVol * cosThetaHalf
+
+        -- Discounted forward: K·e^{-rT}
+        kDiscount : Decimal = k * discount
+
+        -- Deltas: probability of exercise (independent of pricing path)
+        deltaCallResult : Decimal = survival
+        deltaPutResult : Decimal = 1.0 - survival
+
+      in if s > k
+         then
+           -- S > K: call is ITM, put is OTM
+           -- Price PUT in log-space, derive CALL from parity
+           let
+             -- Put intrinsic: -(m+μ) · Φ_D(x*) = -(m+μ) · (1 - survival)
+             -- Since m+μ > 0 when S > K (adjusted for drift),
+             -- the put contribution is: density - |m+μ| · cdfXStar
+             cdfXStar : Decimal = 1.0 - survival
+             putIntrinsic : Decimal = negate mPlusMu * cdfXStar
+             putLogRaw : Decimal = densityTerm + putIntrinsic
+             putLogNorm : Decimal = putLogRaw * discount
+
+             putPriceResult : Decimal =
+               if putLogNorm > 0.0
+               then s * (tExp putLogNorm - 1.0)
+               else 0.0
+
+             -- Call from price-space parity: C = P + S - K·e^{-rT}
+             callPriceResult : Decimal = putPriceResult + s - kDiscount
+
+           in OptionResult
+               { callPrice  = callPriceResult
+               , putPrice   = putPriceResult
+               , deltaCalls = deltaCallResult
+               , deltaPut   = deltaPutResult
+               }
+         else
+           -- S ≤ K: put is ITM, call is OTM
+           -- Price CALL in log-space, derive PUT from parity
+           let
+             callIntrinsic : Decimal = mPlusMu * survival
+             callLogRaw : Decimal = densityTerm + callIntrinsic
+             callLogNorm : Decimal = callLogRaw * discount
+
+             callPriceResult : Decimal =
+               if callLogNorm > 0.0
+               then s * (tExp callLogNorm - 1.0)
+               else 0.0
+
+             -- Put from price-space parity: P = C - S + K·e^{-rT}
+             putPriceResult : Decimal = callPriceResult - s + kDiscount
+
+           in OptionResult
+               { callPrice  = callPriceResult
+               , putPrice   = putPriceResult
+               , deltaCalls = deltaCallResult
+               , deltaPut   = deltaPutResult
+               }

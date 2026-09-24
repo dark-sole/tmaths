@@ -2,7 +2,9 @@
 // © 2025 Tokenisys. All rights reserved.
 pragma solidity ^0.8.31;
 
-import {TMaths} from "./TMaths.sol";
+// To deploy on a non-Fusaka chain (e.g. Base, OP Mainnet, Unichain as of May 2026),
+// change the import below to: import {TMathLegacy as TMaths} from "./TMathLegacy.sol";
+import {TMathFusaka as TMaths} from "./TMathFusaka.sol";
 
 /// @title NormalCDF - Standard Normal Cumulative Distribution Function
 /// @notice Computes Φ(x) for Black-Scholes N(d1), N(d2)

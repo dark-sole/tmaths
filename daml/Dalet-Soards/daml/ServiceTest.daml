@@ -1,0 +1,121 @@
+module ServiceTest where
+
+import PricingService
+import Daml.Script
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- PricingService Test — generates transactions on the ledger
+-- ═══════════════════════════════════════════════════════════════════════════
+
+testService : Script ()
+testService = do
+  -- Allocate parties
+  operator <- allocateParty "Tokenisys"
+  client   <- allocateParty "TradingDesk"
+
+  -- Step 1: Operator proposes the service
+  proposalCid <- submit operator do
+    createCmd ServiceProposal with operator; client
+
+  -- Step 2: Client accepts — creates PricingService
+  serviceCid <- submit client do
+    exerciseCmd proposalCid AcceptService
+
+  -- Step 3: Client requests ATM pricing
+  (result1Cid, serviceCid2) <- submit client do
+    exerciseCmd serviceCid RequestPrice with
+      spot      = 100.0
+      strike    = 100.0
+      timeToExp = 0.25
+      rate      = 0.05
+      vol       = 0.20
+      ref       = "AAPL-ATM-3M"
+
+  -- Step 4: Another pricing request (ITM call)
+  (result2Cid, serviceCid3) <- submit client do
+    exerciseCmd serviceCid2 RequestPrice with
+      spot      = 100.0
+      strike    = 90.0
+      timeToExp = 0.25
+      rate      = 0.05
+      vol       = 0.20
+      ref       = "AAPL-ITM-3M"
+
+  -- Step 5: OTM call
+  (result3Cid, serviceCid4) <- submit client do
+    exerciseCmd serviceCid3 RequestPrice with
+      spot      = 100.0
+      strike    = 110.0
+      timeToExp = 0.25
+      rate      = 0.05
+      vol       = 0.20
+      ref       = "AAPL-OTM-3M"
+
+  -- Step 6: CDF request for VaR
+  (cdfCid, serviceCid5) <- submit client do
+    exerciseCmd serviceCid4 RequestCDF with
+      xValue = 2.0647416046   -- 95th percentile
+      ref    = "VaR-95pct"
+
+  -- Step 7: Deep OTM — precision stress test
+  (result4Cid, serviceCid6) <- submit client do
+    exerciseCmd serviceCid5 RequestPrice with
+      spot      = 100.0
+      strike    = 150.0
+      timeToExp = 0.25
+      rate      = 0.05
+      vol       = 0.20
+      ref       = "AAPL-DeepOTM"
+
+  -- Step 8: Risk analytics — VaR/CVaR for a portfolio
+  -- 2% daily vol, zero expected return
+  (riskCid, serviceCid7) <- submit client do
+    exerciseCmd serviceCid6 RequestRisk with
+      mu    = 0.0
+      sigma = 0.02
+      ref   = "Portfolio-Daily"
+
+  -- Step 9: Risk analytics — higher vol scenario
+  (riskCid2, serviceCid8) <- submit client do
+    exerciseCmd serviceCid7 RequestRisk with
+      mu    = 0.001    -- slight positive drift
+      sigma = 0.035    -- 3.5% daily vol (stressed market)
+      ref   = "Portfolio-Stressed"
+
+  -- Verify results exist on the ledger
+  results <- query @PricingResult client
+  cdfResults <- query @CDFResult client
+  riskResults <- query @RiskResultContract client
+
+  -- Dump all results
+  let showPR (_, r) = r.ref
+        <> " | call=" <> show r.callPrice
+        <> " | put=" <> show r.putPrice
+        <> " | dC=" <> show r.deltaCall
+        <> " | dP=" <> show r.deltaPut
+  let showCR (_, r) = r.ref
+        <> " | x=" <> show r.xValue
+        <> " | cdf=" <> show r.cdf
+        <> " | surv=" <> show r.survival
+  let showRR (_, r) = r.ref
+        <> " | VaR95=" <> show r.var95
+        <> " | VaR99=" <> show r.var99
+        <> " | CVaR95=" <> show r.cvar95
+        <> " | CVaR99=" <> show r.cvar99
+
+  let resultLines = map showPR results
+  let cdfLines = map showCR cdfResults
+  let riskLines = map showRR riskResults
+  let allLines = foldl (\acc l -> acc <> "\n  " <> l) "" resultLines
+  let allCdfLines = foldl (\acc l -> acc <> "\n  " <> l) "" cdfLines
+  let allRiskLines = foldl (\acc l -> acc <> "\n  " <> l) "" riskLines
+
+  assertMsg ("SERVICE TEST RESULTS:"
+    <> "\n  Pricing results: " <> show (length results)
+    <> "\n  CDF results: " <> show (length cdfResults)
+    <> "\n  Risk results: " <> show (length riskResults)
+    <> allLines
+    <> allCdfLines
+    <> allRiskLines
+    <> "\n  Transactions: 9 (1 proposal + 1 accept + 4 prices + 1 CDF + 2 risk)"
+    ) False
