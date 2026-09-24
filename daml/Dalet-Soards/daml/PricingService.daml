@@ -62,10 +62,12 @@ template PricingService
           timeToExp
           rate
           vol
-          callPrice  = result.callPrice
-          putPrice   = result.putPrice
-          deltaCall  = result.deltaCalls
-          deltaPut   = result.deltaPut
+          -- The pricer returns Numeric 18; the directed cast to Decimal is made here, where
+          -- the price is recorded (ruling 25): prices up, deltas to nearest.
+          callPrice  = toDecimalUp result.callPrice
+          putPrice   = toDecimalUp result.putPrice
+          deltaCall  = toDecimalNearest result.deltaCalls
+          deltaPut   = toDecimalNearest result.deltaPut
 
         -- Re-create the service for the next request
         serviceCid <- create PricingService with operator; client

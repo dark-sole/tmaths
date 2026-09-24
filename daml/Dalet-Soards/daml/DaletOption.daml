@@ -1,48 +1,126 @@
--- Copyright © 2025 Tokenisys (The Dark Sole Enterprise Ltd). All rights reserved.
+-- Copyright © 2025-2026 Tokenisys (The Dark Sole Enterprise Ltd). All rights reserved.
 --
--- DaletOption: European option pricing with Dalet distribution on Canton Network
+-- DaletOption: European option pricing with the Dalet distribution on Canton Network
 --
--- Ports DaletOption.sol to Daml. The Dalet distribution (Student-t, ν=2)
--- has heavier tails than Normal, giving higher prices for deep OTM options.
+-- The standard is PERP/reference/fundingbond/model.py (`dalet_price`) and its vectors.json;
+-- the structure is that of solidity/src/DaletOption.sol.
 --
--- All computation stays in log-space where integrals are elementary trigonometric.
+-- Log-return y = mu + s X, X Dalet, with
+--   m  = ln(S/K)              log-moneyness
+--   mu = (r - sigma^2/2) T    drift
+--   s  = sigma sqrt(T)        scale
+--   w  = (m + mu)/s           standardised forward moneyness (w = -x*)
 --
--- Log-space call formula:
---   C_log = e^{-rT} · [ s·cos(θ*)/2  +  (m + μ) · (1 - Φ_D(x*)) ]
+-- The log-space legs in closed form, written in m + mu and s so that w, which is unbounded
+-- as s falls, is never formed (R = s sqrt(1 + w^2) = sqrt(s^2 + (m + mu)^2)):
+--   call_log = e^{-rT} (R + (m + mu))/2
+--   put_log  = e^{-rT} (R - (m + mu))/2
+-- Where the sign of m + mu makes one a difference it is evaluated as s^2 / (2 (R + |m + mu|)):
+-- no CDF and no subtraction of near-equal terms.
 --
--- where:
---   m  = ln(S/K)                — log-moneyness
---   μ  = (r - σ²/2)·T          — risk-neutral drift
---   s  = σ·√T                   — volatility-scaled time
---   x* = -(m + μ)/s            — standardised exercise threshold
---   cos(θ*)/2 = 1/(2√(1+x*²)) — density integral ∫_{x*}^∞ x·φ_D(x)dx
---   Φ_D(x) = (1 + x/√(1+x²))/2 — Dalet CDF
+-- Ruling 22 (PERP HANDOFF; dalet_updated.tex section 2.3 and section 5): the out-of-the-money
+-- leg is priced in log space, S <= K the call and S > K the put, and converted to price as
+-- S expm1(leg_log); the other leg follows by price-space parity, C - P = S - K e^{-rT}.
 --
--- Price conversion: C = S · (exp(C_log_norm) - 1)
--- Put via log-space parity: P_log = C_log - (m + μ) · e^{-rT}
+-- Ruling 25: Decimal at the interface, Numeric 18 inside. The pricer computes at 30 places
+-- (TMaths.W) and returns Numeric 18. `daletPrice` takes Decimal inputs and returns the same
+-- Numeric 18 result; the cast to Decimal belongs to the contract where a charge settles, and is
+-- directed: `toDecimalUp` for an amount a payer is charged, `toDecimalDown` for one received.
 --
--- PRECISION NOTE:
---   This function chains: ln → sqrt → division → multiplication → exp
---   Each step truncates at Daml's 10-digit Decimal precision.
---   The compounding error through 5+ operations is where Canton's
---   precision ceiling becomes most visible vs Solidity's 18 digits.
---   This is the core demonstration of why Fortress (FortVM) is needed.
+-- Rounding: call and put are charged amounts, rounded up: each is at or above the exact price.
+-- The margin covers the rounding to 18 places (half a unit each, of the leg and of K e^{-rT})
+-- and the 30-place working error: 2 units in the last place plus one per 1e9 of S + K.
+--
+-- Deltas are the probabilities of exercise (dalet_updated.tex Table 3):
+--   deltaCalls = 1 - D(x*) = D(w), deltaPut = D(x*) = D(-w), summing to exactly 1,
+-- the smaller by the stable tail D(-|w|) = s^2 / (2 R (R + |m + mu|)), rounded to nearest.
+--
+-- Errors (Left from daletPriceE): a non-positive S, K, T or sigma, a negative r; ZeroScale when
+-- s < 1e-18; NegativeParityLeg when the leg derived by parity is below zero (at the money when
+-- r is large against sigma).
 
 module DaletOption where
 
+import qualified DA.Numeric as N
 import TMaths
-import DaletCDF
 
--- | Result record for option pricing
+-- | Result of pricing, at 18 places.
 data OptionResult = OptionResult
   with
-    callPrice  : Decimal  -- Call option price in underlying terms
-    putPrice   : Decimal  -- Put option price in underlying terms
-    deltaCalls : Decimal  -- Call delta ∈ [0, 1] (probability of exercise)
-    deltaPut   : Decimal  -- Put delta ∈ [0, 1] (= 1 - deltaCall)
+    callPrice  : Numeric 18  -- call price in quote terms, rounded up
+    putPrice   : Numeric 18  -- put price in quote terms, rounded up
+    deltaCalls : Numeric 18  -- call probability of exercise in [0, 1]
+    deltaPut   : Numeric 18  -- put probability of exercise in [0, 1] (= 1 - deltaCalls)
   deriving (Show, Eq)
 
--- | Price a European option using the Dalet distribution.
+ulpN : N18
+ulpN = 0.000000000000000001
+
+-- | The rounding margin: 2 units in the last place plus one per 1e9 of S + K.
+marginN : N18 -> N18 -> N18
+marginN s k = intToNumeric (2 + truncate ((s + k) / 1000000000.0)) * ulpN
+
+-- | The pricer, Numeric 18 in and out; Left on inputs outside its domain.
+daletPriceE : N18 -> N18 -> N18 -> N18 -> N18 -> Either Text OptionResult
+daletPriceE s k t r sigma
+  | s <= 0.0     = Left "DaletOption: spot must be positive"
+  | k <= 0.0     = Left "DaletOption: strike must be positive"
+  | t <= 0.0     = Left "DaletOption: time must be positive"
+  | sigma <= 0.0 = Left "DaletOption: volatility must be positive"
+  | r < 0.0      = Left "DaletOption: rate must not be negative"
+  | otherwise =
+      let
+        -- s^2 = sigma^2 T and s, 30 places
+        sig2 : W = N.mul sigma sigma
+        s2 : W = N.mul sig2 t
+        sv : W = sqrtW s2
+      in if sv < 0.000000000000000001 then Left "DaletOption: ZeroScale: sigma sqrt(T) below 1e-18"
+      else
+        let
+          rt : W = N.mul r t
+          -- m + mu
+          mm : W = lnW s - lnW k + rt - s2 / 2.0
+          am = abs mm
+          -- R = s sqrt(1 + w^2)
+          big = sqrtW (s2 + mm * mm)
+
+          -- Deltas: the smaller by the stable tail, the other its complement
+          tl : N18 = N.castAndRound (s2 / (2.0 * big * (big + am)))
+          (dC, dP) = if mm > 0.0 then (1.0 - tl, tl) else (tl, 1.0 - tl)
+
+          -- Discount e^{-rT}
+          disc : W = expW (negate rt)
+
+          -- The out-of-the-money leg in log space
+          callLeg = s <= k
+          tailForm = if callLeg then mm < 0.0 else mm > 0.0
+          legRaw : W = if tailForm then s2 / (2.0 * (big + am)) else (big + am) / 2.0
+          leg : W = legRaw * disc
+
+          margin = marginN s k
+          otm : N18 = N.mul s (expm1W leg) + margin
+          kd : N18 = N.mul k disc
+        in if callLeg
+           then
+             -- P = C - S + K e^{-rT}, K e^{-rT} rounded up
+             let put = otm + (kd + margin) - s
+             in if put < 0.0 then Left "DaletOption: NegativeParityLeg"
+                else Right OptionResult with
+                  callPrice = otm; putPrice = put; deltaCalls = dC; deltaPut = dP
+           else
+             -- C = P + S - K e^{-rT}, K e^{-rT} rounded down
+             let call = otm + s - (kd - margin)
+             in if call < 0.0 then Left "DaletOption: NegativeParityLeg"
+                else Right OptionResult with
+                  callPrice = call; putPrice = otm; deltaCalls = dC; deltaPut = dP
+
+-- | The pricer, Numeric 18 in and out; aborts on inputs outside its domain.
+daletPriceN : N18 -> N18 -> N18 -> N18 -> N18 -> OptionResult
+daletPriceN s k t r sigma = case daletPriceE s k t r sigma of
+  Left msg  -> error msg
+  Right res -> res
+
+-- | The Decimal interface: Decimal inputs, the Numeric 18 result.
 --
 --   Inputs:
 --     s     - spot price     (e.g. 100.0 = $100)
@@ -50,144 +128,25 @@ data OptionResult = OptionResult
 --     t     - time to expiry in years (e.g. 0.25 = 3 months)
 --     r     - risk-free rate as decimal (e.g. 0.05 = 5%)
 --     sigma - volatility as decimal (e.g. 0.20 = 20%)
---
---   Outputs: OptionResult with call/put prices and deltas
 daletPrice : Decimal -> Decimal -> Decimal -> Decimal -> Decimal -> OptionResult
-daletPrice s k t r sigma
-  | s <= 0.0     = error "DaletOption: spot must be positive"
-  | k <= 0.0     = error "DaletOption: strike must be positive"
-  | t <= 0.0     = error "DaletOption: time must be positive"
-  | sigma <= 0.0 = error "DaletOption: volatility must be positive"
-  | otherwise =
-      let
-        -- ═══════════════════════════════════════════════════════════════
-        -- Step 1: Core intermediates
-        -- ═══════════════════════════════════════════════════════════════
+daletPrice s k t r sigma = daletPriceN (N.cast s) (N.cast k) (N.cast t) (N.cast r) (N.cast sigma)
 
-        -- √T
-        sqrtT : Decimal = tSqrt t
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Directed casts to Decimal, for the contract where a charge settles (ruling 25)
+-- ═══════════════════════════════════════════════════════════════════════════
 
-        -- m = ln(S/K) — log-moneyness
-        -- Using native signed Decimal eliminates all the sign-tracking
-        -- assembly from the Solidity version
-        m : Decimal = tLn (s / k)
+-- | An amount a payer is charged: rounded up to 10 places.
+toDecimalUp : Numeric 18 -> Decimal
+toDecimalUp x =
+  let d : Decimal = N.castAndRound x
+  in if (N.cast d : Numeric 18) < x then d + 0.0000000001 else d
 
-        -- μ = (r - σ²/2) · T — risk-neutral drift
-        mu : Decimal = (r - sigma * sigma / 2.0) * t
+-- | An amount received: rounded down to 10 places.
+toDecimalDown : Numeric 18 -> Decimal
+toDecimalDown x =
+  let d : Decimal = N.castAndRound x
+  in if (N.cast d : Numeric 18) > x then d - 0.0000000001 else d
 
-        -- s_vol = σ · √T — volatility-scaled time
-        sVol : Decimal = sigma * sqrtT
-
-        -- m + μ — combined log-forward
-        mPlusMu : Decimal = m + mu
-
-        -- ═══════════════════════════════════════════════════════════════
-        -- Step 2: Standardised exercise threshold
-        --   x* = -(m + μ) / s
-        -- ═══════════════════════════════════════════════════════════════
-
-        xStar : Decimal = negate mPlusMu / sVol
-
-        -- ═══════════════════════════════════════════════════════════════
-        -- Step 3: Dalet CDF and density integral via DaletCDF module
-        --
-        --   survival = 1 - Φ_D(x*)                   — tail probability
-        --   cos(θ*)/2 = 1/(2·√(1+x*²))              — density integral
-        --
-        -- PRECISION NOTE:
-        --   The CDF is well-conditioned (single sqrt + division).
-        --   Precision loss is minimal here compared to the Taylor-based
-        --   functions. Main degradation occurs downstream when these
-        --   feed into further multiplications and exp().
-        -- ═══════════════════════════════════════════════════════════════
-
-        survival : Decimal = daletSurvival xStar
-
-        cosThetaHalf : Decimal = daletDensityIntegral xStar
-
-        -- ═══════════════════════════════════════════════════════════════
-        -- Step 4: Discount factor e^{-rT}
-        -- ═══════════════════════════════════════════════════════════════
-
-        discount : Decimal = tExp (negate (r * t))
-
-        -- ═══════════════════════════════════════════════════════════════
-        -- Step 5: Log-space pricing — always price the OTM side first
-        --
-        -- The log-space formula is most accurate for OTM options (small
-        -- values). The ITM side is derived via put-call parity in
-        -- PRICE-SPACE, which avoids the exp(x)-1 cancellation that
-        -- degrades precision for larger values.
-        --
-        -- Call log-space formula:
-        --   C_log = e^{-rT} · [ s·cos(θ*)/2  +  (m+μ) · survival ]
-        --
-        -- Put log-space formula (by symmetry, using -x*):
-        --   P_log = e^{-rT} · [ s·cos(θ*)/2  -  (m+μ) · (1-survival) ]
-        --         = e^{-rT} · [ s·cos(θ*)/2  -  (m+μ) · Φ_D(x*) ]
-        --   Note: cos(θ*)/2 is symmetric in x*, so density term is same.
-        --
-        -- Price-space put-call parity:
-        --   C - P = S - K·e^{-rT}
-        --   So: C = P + S - K·e^{-rT}
-        --       P = C - S + K·e^{-rT}
-        -- ═══════════════════════════════════════════════════════════════
-
-        densityTerm : Decimal = sVol * cosThetaHalf
-
-        -- Discounted forward: K·e^{-rT}
-        kDiscount : Decimal = k * discount
-
-        -- Deltas: probability of exercise (independent of pricing path)
-        deltaCallResult : Decimal = survival
-        deltaPutResult : Decimal = 1.0 - survival
-
-      in if s > k
-         then
-           -- S > K: call is ITM, put is OTM
-           -- Price PUT in log-space, derive CALL from parity
-           let
-             -- Put intrinsic: -(m+μ) · Φ_D(x*) = -(m+μ) · (1 - survival)
-             -- Since m+μ > 0 when S > K (adjusted for drift),
-             -- the put contribution is: density - |m+μ| · cdfXStar
-             cdfXStar : Decimal = 1.0 - survival
-             putIntrinsic : Decimal = negate mPlusMu * cdfXStar
-             putLogRaw : Decimal = densityTerm + putIntrinsic
-             putLogNorm : Decimal = putLogRaw * discount
-
-             putPriceResult : Decimal =
-               if putLogNorm > 0.0
-               then s * (tExp putLogNorm - 1.0)
-               else 0.0
-
-             -- Call from price-space parity: C = P + S - K·e^{-rT}
-             callPriceResult : Decimal = putPriceResult + s - kDiscount
-
-           in OptionResult
-               { callPrice  = callPriceResult
-               , putPrice   = putPriceResult
-               , deltaCalls = deltaCallResult
-               , deltaPut   = deltaPutResult
-               }
-         else
-           -- S ≤ K: put is ITM, call is OTM
-           -- Price CALL in log-space, derive PUT from parity
-           let
-             callIntrinsic : Decimal = mPlusMu * survival
-             callLogRaw : Decimal = densityTerm + callIntrinsic
-             callLogNorm : Decimal = callLogRaw * discount
-
-             callPriceResult : Decimal =
-               if callLogNorm > 0.0
-               then s * (tExp callLogNorm - 1.0)
-               else 0.0
-
-             -- Put from price-space parity: P = C - S + K·e^{-rT}
-             putPriceResult : Decimal = callPriceResult - s + kDiscount
-
-           in OptionResult
-               { callPrice  = callPriceResult
-               , putPrice   = putPriceResult
-               , deltaCalls = deltaCallResult
-               , deltaPut   = deltaPutResult
-               }
+-- | A quantity that is not an amount (a delta, a probability): nearest.
+toDecimalNearest : Numeric 18 -> Decimal
+toDecimalNearest = N.castAndRound

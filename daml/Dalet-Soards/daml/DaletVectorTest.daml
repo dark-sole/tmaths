@@ -1,0 +1,73 @@
+-- Copyright © 2026 Tokenisys (The Dark Sole Enterprise Ltd). All rights reserved.
+--
+-- DaletOption.daml against the funding bond reference vectors (PERP vectors.json).
+--
+-- Call and put are charged amounts: each must be at or above the ceiling of the exact value at
+-- 18 places, and within three rounding margins of it. Deltas carry no direction: each within
+-- two units in the last place. D within one unit. Every result is traced as
+-- `VEC id output value` for the error report.
+
+module DaletVectorTest where
+
+import Daml.Script
+import DA.Foldable (forA_)
+import qualified DA.Text as T
+import DaletOption
+import DaletCDF
+import DaletVectors
+
+ulp : Numeric 18
+ulp = 0.000000000000000001
+
+traceVec : Text -> Text -> Numeric 18 -> Script ()
+traceVec i name v = debug ("VEC " <> i <> " " <> name <> " " <> show v)
+
+checkUp : Text -> Text -> Numeric 18 -> Numeric 18 -> Numeric 18 -> Script ()
+checkUp i name got ceil tol = do
+  traceVec i name got
+  assertMsg (i <> " " <> name <> ": below the exact value (rounding up)") (got >= ceil)
+  assertMsg (i <> " " <> name <> ": excess over the exact value " <> show (got - ceil))
+    (got - ceil <= tol)
+
+checkNear : Text -> Text -> Numeric 18 -> Numeric 18 -> Numeric 18 -> Numeric 18 -> Script ()
+checkNear i name got lo hi tol = do
+  traceVec i name got
+  assertMsg (i <> " " <> name <> ": error") (got >= lo - tol && got <= hi + tol)
+
+testPriceVectors : Script ()
+testPriceVectors = forA_ priceVectors \v -> do
+  let res = daletPriceN v.s v.k v.t v.r v.sigma
+      tol = 3.0 * marginN v.s v.k + 2.0 * ulp
+  checkUp v.vid "call" res.callPrice v.callC tol
+  checkUp v.vid "put" res.putPrice v.putC tol
+  assertMsg (v.vid <> ": deltas sum to one") (res.deltaCalls + res.deltaPut == 1.0)
+  if v.checkDeltas
+    then do
+      checkNear v.vid "delta_call" res.deltaCalls v.dcF v.dcC (2.0 * ulp)
+      checkNear v.vid "delta_put" res.deltaPut v.dpF v.dpC (2.0 * ulp)
+    else pure ()
+
+testCdfVectors : Script ()
+testCdfVectors = forA_ cdfVectors \v -> do
+  let got = daletCdfN v.x
+  traceVec v.cid "value" got
+  assertMsg (v.cid <> ": D") (got >= v.lo - ulp && got <= v.hi + ulp)
+
+testLeftVectors : Script ()
+testLeftVectors = forA_ leftVectors \v ->
+  case daletPriceE v.ls v.lk v.lt v.lr v.lsigma of
+    Left msg -> assertMsg (v.lid <> ": wrong refusal " <> msg) (T.isInfixOf v.reason msg)
+    Right _  -> assertMsg (v.lid <> ": priced, expected " <> v.reason) False
+
+
+-- | Every output, for the error report: run with
+--   daml script --dar .daml/dist/dalet-option-1.0.0.dar --script-name DaletVectorTest:reportVectors
+--     --ide-ledger --output-file <file>
+reportVectors : Script [(Text, Text, Numeric 18)]
+reportVectors = pure (concatMap row priceVectors <> map cdfRow cdfVectors)
+  where
+    row v =
+      let res = daletPriceN v.s v.k v.t v.r v.sigma
+      in [ (v.vid, "call", res.callPrice), (v.vid, "put", res.putPrice)
+         , (v.vid, "delta_call", res.deltaCalls), (v.vid, "delta_put", res.deltaPut) ]
+    cdfRow v = (v.cid, "value", daletCdfN v.x)

@@ -20,41 +20,52 @@
 --   - Risk-adjusted return distributions
 --   - Any application requiring fat-tailed probability estimates
 --
--- PRECISION NOTE:
---   The CDF itself is well-conditioned — just one sqrt and one division.
---   Precision loss is minimal here compared to the Taylor-based functions
---   in TMaths. The main degradation occurs when this feeds into further
---   calculations (e.g., survival × forward in option pricing).
+-- PRECISION (24 September 2026):
+--   The CDF is evaluated by the stable tail (daletCdfN): for x < 0,
+--   D(x) = 1/(2 q (q - x)), q = sqrt(1 + x^2), with no subtraction of near-equal
+--   terms, and D(x) = 1 - D(-x) for x >= 0. Beyond |x| = 1 it is written in t = 1/|x|,
+--   D(-|x|) = t^2 / (2 q' (q' + 1)), q' = sqrt(1 + t^2), so that |x| up to 1e20 neither
+--   overflows nor rounds to 0 before the last place. Computed at 30 places, delivered at 18
+--   (ruling 25); the Decimal functions round that to 10.
 
 module DaletCDF where
 
+import qualified DA.Numeric as N
 import TMaths
+
+-- | The lower tail D(-a), a >= 0, at 30 places.
+daletTailW : N18 -> W
+daletTailW a
+  | a <= 1.0  =
+      let aw : W = N.cast a
+          q = sqrtW (1.0 + aw * aw)
+      in 1.0 / (2.0 * q * (q + aw))
+  | otherwise =
+      let t : W = N.div (intToNumeric 1 : Numeric 0) a
+          q = sqrtW (1.0 + t * t)
+      in t * t / (2.0 * q * (q + 1.0))
+
+-- | Dalet CDF at 18 places, stable in both tails.
+daletCdfN : N18 -> N18
+daletCdfN x =
+  let tl = daletTailW (abs x)
+  in N.castAndRound (if x < 0.0 then tl else 1.0 - tl)
 
 -- | Dalet CDF: Φ_D(x) = (1 + x/√(1+x²)) / 2
 --
 --   Input: any real number x (as Decimal)
 --   Output: probability in [0, 1]
 --
---   The computation is:
---     sinθ = x / √(1 + x²)     — sin(arctan(x))
---     Φ_D(x) = (1 + sinθ) / 2
---
---   This is the "fast" path from DaletCDF.sol (daletCdfFast).
---   Single sqrt call, no series approximation.
+--   Φ_D(x) = (1 + sinθ)/2, sinθ = x/√(1 + x²), evaluated by the stable tail of
+--   daletCdfN and rounded to 10 places.
 daletCdf : Decimal -> Decimal
-daletCdf x
-  | x == 0.0  = 0.5
-  | otherwise =
-      let
-        sqrtDenom : Decimal = tSqrt (1.0 + x * x)
-        sinTheta : Decimal = x / sqrtDenom
-      in (1.0 + sinTheta) / 2.0
+daletCdf x = N.castAndRound (daletCdfN (N.cast x))
 
 -- | Dalet survival function: 1 - Φ_D(x)
 --   Equivalent to Φ_D(-x) by symmetry.
 --   Used directly in option pricing for tail probability.
 daletSurvival : Decimal -> Decimal
-daletSurvival x = 1.0 - daletCdf x
+daletSurvival x = daletCdf (negate x)
 
 -- | Dalet PDF: φ_D(x) = 1 / (2·(1+x²)^(3/2))
 --   Useful for density-weighted integrals and risk analytics.
