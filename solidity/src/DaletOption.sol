@@ -1,31 +1,41 @@
 // SPDX-License-Identifier: UNLICENSED
-// © 2025 Tokenisys. All rights reserved.
+// © 2025-2026 Tokenisys. All rights reserved.
 pragma solidity ^0.8.31;
 
-// To deploy on a non-Fusaka chain (e.g. Base, OP Mainnet, Unichain as of May 2026),
-// change the import below to: import {TMathLegacy as TMaths} from "./TMathLegacy.sol";
-import {TMathFusaka as TMaths} from "./TMathFusaka.sol";
+import {FixedPointMathLib as FPML} from "solady/utils/FixedPointMathLib.sol";
 
-/// @title DaletOption - European option pricing with Dalet distribution
-/// @notice Prices options in log-space using the Dalet CDF: Φ_D(x) = (1 + x/√(1+x²))/2
-/// @dev All computation stays in log-space where integrals are elementary trigonometric.
-///      The Dalet distribution (Student-t, ν=2) has heavier tails than Normal,
-///      giving higher prices for deep OTM options.
+/// @title DaletOption - European option pricing with the Dalet distribution
+/// @notice Prices options in log space under the Dalet CDF D(x) = (1 + x/sqrt(1+x^2))/2.
+/// @dev The standard is PERP/reference/fundingbond/model.py (`dalet_price`) and its vectors.json.
 ///
-///      Log-space call formula:
-///        C_log = e^{-rT} · [ s·cos(θ*)/2  +  (m + μ) · (1 - Φ_D(x*)) ]
+///      Log-return y = mu + s X, X Dalet, with
+///        m  = ln(S/K)                  log-moneyness
+///        mu = (r - sigma^2/2) T        drift
+///        s  = sigma sqrt(T)            scale
+///        w  = (m + mu)/s               standardised forward moneyness (w = -x*)
 ///
-///      where:
-///        m  = ln(S/K)                  — log-moneyness
-///        μ  = (r - σ²/2)·T            — risk-neutral drift
-///        s  = σ·√T                     — volatility-scaled time
-///        x* = -(m + μ)/s              — standardised exercise threshold
-///        θ* = arctan(x*)              — angular threshold
-///        cos(θ*)/2 = 1/(2√(1+x*²))   — density integral ∫_{x*}^∞ x·φ_D(x)dx
-///        Φ_D = (1+x/√(1+x²))/2       — Dalet CDF
+///      The log-space legs in closed form (dalet_updated.tex eq. (5) integrated out):
+///        call_log = e^{-rT} s (sqrt(1+w^2) + w)/2
+///        put_log  = e^{-rT} s (sqrt(1+w^2) - w)/2
+///      Where the sign of w makes one a difference, it is evaluated as
+///        s / (2 (sqrt(1+w^2) + |w|)): no CDF and no subtraction of near-equal terms.
 ///
-///      Price conversion: C = S · (exp(C_log/S) - 1)
-///      Put via log-space parity: P_log = C_log - (m + μ) · e^{-rT}
+///      Ruling 22 (PERP HANDOFF, dalet_updated.tex section 2.3 and section 5): the
+///      out-of-the-money leg is priced in log space, S <= K the call and S > K the put, and
+///      converted to price as S expm1(leg_log). The other leg follows by price-space parity,
+///      C - P = S - K e^{-rT}.
+///
+///      Maths: Solady FixedPointMathLib v0.1.26 (`lnWad`, `expWad`, `sqrt`), ruling 23. The scale,
+///      w and the log legs are carried at 1e27 (RAY) so that the WAD output is not rounded twice.
+///
+///      Rounding: call and put are amounts a payer is charged, so each is rounded up: the result
+///      is never below the exact price (tested against the vectors). The margin covering the
+///      approximation error of lnWad and expWad is MARGIN_WEI plus MARGIN_PER_UNIT wei per unit
+///      of S + K; see `_margin`.
+///
+///      Deltas are the probabilities of exercise, as in dalet_updated.tex Table 3:
+///        delta_call = 1 - D(x*) = D(w),  delta_put = D(x*) = D(-w),  summing to exactly 1e18,
+///      the smaller computed by the stable tail D(-a) = 1/(2 q (q + a)), q = sqrt(1+a^2), a >= 0.
 ///
 ///      Inputs (all scaled 1e18):
 ///        S     - spot price (e.g. 100e18 = $100)
@@ -35,16 +45,41 @@ import {TMathFusaka as TMaths} from "./TMathFusaka.sol";
 ///        sigma - volatility (e.g. 20e16 = 20%)
 ///
 ///      Outputs (all scaled 1e18):
-///        call_price  - call option price in underlying terms
-///        put_price   - put option price in underlying terms
-///        delta_call  - call delta in [0, 1e18]
-///        delta_put   - put delta in [0, 1e18] (represents negative value)
+///        call_price  - call option price in quote terms, rounded up
+///        put_price   - put option price in quote terms, rounded up
+///        delta_call  - call probability of exercise in [0, 1e18]
+///        delta_put   - put probability of exercise in [0, 1e18] (represents a negative delta)
+///
+///      Reverts: ZeroSpot, ZeroStrike, ZeroTime, ZeroVol on a zero input; ZeroScale when
+///      s = sigma sqrt(T) is below 1e-18 (it would round to zero at WAD); NegativeParityLeg when
+///      the leg derived by parity is below zero (at the money when r is large against sigma).
 library DaletOption {
 
     error ZeroSpot();
     error ZeroStrike();
     error ZeroTime();
     error ZeroVol();
+    error ZeroScale();
+    error NegativeParityLeg();
+
+    uint256 internal constant WAD = 1e18;
+    uint256 internal constant RAY = 1e27;
+
+    /// @dev expm1 sums its Taylor series below this argument (0.5, RAY) and uses expWad above.
+    ///      At 0.5 the series needs 27 terms to reach 1e-27; above it, expm1 >= 0.65 and the
+    ///      subtraction of 1 from expWad costs no significant figure.
+    uint256 internal constant EXPM1_SERIES_BELOW = 5e26;
+
+    /// @dev |w| above which sqrt(1 + w^2) is taken as |w| (relative error below 1e-22) and
+    ///      w^2 at RAY would overflow.
+    uint256 internal constant W_LARGE = 1e38;
+
+    /// @dev Rounding margin: covers lnWad (about 1 wei each of ln S and ln K) and expWad
+    ///      (about 1e-18 relative) carried through the price conversion and K e^{-rT}: about
+    ///      1 wei per unit of S + K each, bounded here by 4. Measured against the vectors the
+    ///      error before the margin is below 0.1 wei per unit of S + K (118 wei at S = 2500).
+    uint256 internal constant MARGIN_WEI = 4;
+    uint256 internal constant MARGIN_PER_UNIT = 4;
 
     function price(
         uint256 S,
@@ -63,224 +98,99 @@ library DaletOption {
         if (T == 0) revert ZeroTime();
         if (sigma == 0) revert ZeroVol();
 
-        // ═══════════════════════════════════════════════════
-        // Library calls (Solidity) — cannot be inlined into assembly
-        // ═══════════════════════════════════════════════════
+        // s^2 = sigma^2 T, exact at 1e54; s at RAY.
+        uint256 s2 = sigma * sigma * T;
+        uint256 s = FPML.sqrt(s2);
+        if (s < 1e9) revert ZeroScale();
 
-        // K_norm = K/S (normalise to S=1)
-        uint256 K_norm = K * 1e18 / S;
+        // m + mu at RAY: m from lnWad, mu = rT - s^2/2.
+        int256 mm = (FPML.lnWad(int256(S)) - FPML.lnWad(int256(K))) * 1e9
+            + int256(r * T / 1e9) - int256(s2 / (2 * RAY));
 
-        // √T
-        uint256 sqrtT = TMaths.sqrt(T);
+        // |w| and q = sqrt(1 + w^2), RAY.
+        uint256 a = FPML.fullMulDiv(uint256(mm < 0 ? -mm : mm), RAY, s);
+        uint256 q = _sqrt1p(a);
 
-        // ln(K/S) — we need ln(S/K) = -ln(K/S)
-        (bool ln_neg, uint256 ln_val) = TMaths.ln(K_norm);
+        // Deltas: the smaller by the stable tail, the other its complement.
+        uint256 tail = _tail(q, a);
+        (delta_call, delta_put) = mm > 0 ? (WAD - tail, tail) : (tail, WAD - tail);
 
-        // ═══════════════════════════════════════════════════
-        // Compute x* (standardised threshold) in assembly
-        //   m = ln(S/K) = -ln(K/S)
-        //   μ = (r - σ²/2)·T
-        //   s = σ·√T
-        //   x* = -(m + μ)/s
-        // ═══════════════════════════════════════════════════
-        uint256 x_star;
-        uint256 x_star_neg;    // 0 = positive, 1 = negative
-        uint256 s_vol;         // σ√T
-        uint256 m_plus_mu;     // |m + μ|
-        uint256 m_plus_mu_neg; // sign of (m + μ)
+        // Discount e^{-rT}, WAD.
+        uint256 disc = uint256(FPML.expWad(-int256(r * T / WAD)));
 
-        assembly {
-            let P := 1000000000000000000
+        // The out-of-the-money leg, log space, RAY. The call's closed form is a difference
+        // when w < 0, the put's when w > 0; those are evaluated as s / (2 (q + |w|)).
+        bool callLeg = S <= K;
+        bool tailForm = callLeg ? mm < 0 : mm > 0;
+        uint256 leg = tailForm
+            ? FPML.fullMulDiv(s, RAY, 2 * (q + a))
+            : FPML.fullMulDiv(s, q + a, 2 * RAY);
+        leg = FPML.fullMulDiv(leg, disc, WAD);
 
-            // s = σ·√T
-            s_vol := div(mul(sigma, sqrtT), P)
+        uint256 margin = _margin(S, K);
+        uint256 otm = FPML.fullMulDivUp(S, _expm1Ray(leg), RAY) + margin;
 
-            // ln(S/K): flip sign of ln(K/S)
-            // lnSK_neg = !ln_neg
-            let lnSK_neg := iszero(ln_neg)
-            let lnSK_val := ln_val
-
-            // μ = (r - σ²/2)·T
-            let sigma_sq_half := div(mul(sigma, sigma), 2000000000000000000)
-            let mu_neg := gt(sigma_sq_half, r)
-            let mu_val := 0
-            switch mu_neg
-            case 1 { mu_val := div(mul(sub(sigma_sq_half, r), T), P) }
-            default { mu_val := div(mul(sub(r, sigma_sq_half), T), P) }
-
-            // m + μ = lnSK + mu (signed addition)
-            switch eq(lnSK_neg, mu_neg)
-            case 1 {
-                // same sign: add magnitudes
-                m_plus_mu_neg := lnSK_neg
-                m_plus_mu := add(lnSK_val, mu_val)
-            }
-            default {
-                // different signs: subtract
-                switch gt(lnSK_val, mu_val)
-                case 1 {
-                    m_plus_mu_neg := lnSK_neg
-                    m_plus_mu := sub(lnSK_val, mu_val)
-                }
-                default {
-                    m_plus_mu_neg := mu_neg
-                    m_plus_mu := sub(mu_val, lnSK_val)
-                }
-            }
-
-            // x* = -(m + μ)/s — flip sign
-            x_star := div(mul(m_plus_mu, P), s_vol)
-            x_star_neg := iszero(m_plus_mu_neg) // flip: -(positive) = negative
-            if iszero(m_plus_mu) { x_star_neg := 0 }
+        if (callLeg) {
+            // P = C - S + K e^{-rT}: K e^{-rT} rounded up, so the put is too.
+            uint256 kd = FPML.fullMulDivUp(K, disc, WAD) + margin;
+            if (otm + kd < S) revert NegativeParityLeg();
+            call_price = otm;
+            put_price = otm + kd - S;
+        } else {
+            // C = P + S - K e^{-rT}: K e^{-rT} rounded down, so the call is rounded up.
+            uint256 kd = FPML.fullMulDiv(K, disc, WAD);
+            kd = kd > margin ? kd - margin : 0;
+            if (otm + S < kd) revert NegativeParityLeg();
+            put_price = otm;
+            call_price = otm + S - kd;
         }
+    }
 
-        // ═══════════════════════════════════════════════════
-        // Dalet CDF and density integral from single sqrt
-        //   √(1 + x*²)   — one sqrt call
-        //   Φ_D(x*) = (1 + x*/√(1+x*²)) / 2      — CDF
-        //   survival = 1 - Φ_D(x*)                  — tail probability
-        //   cos(θ*)/2 = 1/(2·√(1+x*²))             — density integral
-        //
-        //   The integral ∫_{x*}^{∞} x·φ_D(x)dx = cos(θ*)/2
-        //   NOT φ_D(x*). The PDF is cos³θ/2 but the
-        //   integral of x·φ(x) = ∫ sinθ dθ = cosθ.
-        // ═══════════════════════════════════════════════════
-        uint256 denom;
-        assembly {
-            let P := 1000000000000000000
-            denom := add(div(mul(x_star, x_star), P), P) // 1 + x*²
+    /// @notice The Dalet CDF D(x), x and result WAD, by the stable tail: for x < 0,
+    ///         D(x) = 1/(2 q (q - x)), q = sqrt(1 + x^2); D(x) = 1 - D(-x) for x >= 0.
+    function daletCdf(int256 x) internal pure returns (uint256) {
+        uint256 a = uint256(x < 0 ? -x : x) * 1e9;
+        uint256 tail = _tail(_sqrt1p(a), a);
+        return x < 0 ? tail : WAD - tail;
+    }
+
+    /// @notice e^y - 1 for y >= 0, argument and result at RAY. Below EXPM1_SERIES_BELOW the
+    ///         Taylor series is summed until its term vanishes at RAY; above, expWad at WAD
+    ///         with a first-order correction for the argument's digits below WAD.
+    function expm1Ray(uint256 y) internal pure returns (uint256) {
+        return _expm1Ray(y);
+    }
+
+    function _expm1Ray(uint256 y) private pure returns (uint256 sum) {
+        if (y == 0) return 0;
+        if (y < EXPM1_SERIES_BELOW) {
+            uint256 term = y;
+            sum = y;
+            for (uint256 n = 2; ; ++n) {
+                term = term * y / (RAY * n);
+                if (term == 0) break;
+                sum += term;
+            }
+            return sum;
         }
-        uint256 sqrt_denom = TMaths.sqrt(denom); // √(1 + x*²)
+        uint256 e = uint256(FPML.expWad(int256(y / 1e9)));
+        return e * 1e9 + e * (y % 1e9) / WAD - RAY;
+    }
 
-        uint256 survival;        // 1 - Φ_D(x*)
-        uint256 cos_theta_half;  // cos(θ*)/2 = 1/(2√(1+x*²))
+    /// @dev sqrt(1 + a^2), a at RAY.
+    function _sqrt1p(uint256 a) private pure returns (uint256) {
+        if (a >= W_LARGE) return a;
+        return FPML.sqrt(RAY * RAY + a * a);
+    }
 
-        assembly {
-            let P := 1000000000000000000
+    /// @dev D(-a) = 1/(2 q (q + a)), q and a at RAY, result WAD.
+    function _tail(uint256 q, uint256 a) private pure returns (uint256) {
+        uint256 t = FPML.fullMulDiv(q, q + a, RAY);
+        return FPML.fullMulDiv(WAD, RAY, 2 * t);
+    }
 
-            // sin_theta = x* / √(1+x*²)
-            let sin_theta := div(mul(x_star, P), sqrt_denom)
-
-            // CDF = (1 ± sinθ)/2 depending on sign
-            // survival = 1 - CDF
-            switch x_star_neg
-            case 1 {
-                // x* negative: CDF = (1 - sinθ)/2, survival = (1 + sinθ)/2
-                survival := div(add(P, sin_theta), 2)
-            }
-            default {
-                // x* positive or zero: CDF = (1 + sinθ)/2, survival = (1 - sinθ)/2
-                survival := div(sub(P, sin_theta), 2)
-            }
-
-            // cos(θ*)/2 = 1/(2·√(1+x*²))
-            // sqrt_denom is 1e18-scaled, so:
-            //   1/(2·sqrt_denom_real) = 1e18/(2·sqrt_denom/1e18) = 1e36/(2·sqrt_denom)
-            cos_theta_half := div(mul(P, P), mul(2, sqrt_denom))
-        }
-
-        // ═══════════════════════════════════════════════════
-        // Discount factor: e^{-rT}
-        // ═══════════════════════════════════════════════════
-        uint256 rT;
-        assembly {
-            rT := div(mul(r, T), 1000000000000000000)
-        }
-        uint256 discount = TMaths.exp(false, rT); // e^{-rT}
-
-        // ═══════════════════════════════════════════════════
-        // Log-space call:
-        //   C_log = e^{-rT} · [ s·cos(θ*)/2  +  (m+μ) · survival ]
-        //
-        //   where s·cos(θ*)/2 = s/(2√(1+x*²)) is the density integral
-        //   and (m+μ)·survival is the intrinsic contribution.
-        //
-        // Log-space put via parity:
-        //   P_log = C_log - (m+μ) · e^{-rT}
-        //
-        // Price conversion:
-        //   C_price = S · (exp(C_log_norm) - 1)
-        //   where C_log_norm = C_log (normalised, S=1)
-        // ═══════════════════════════════════════════════════
-
-        // exp for final conversion — compute after assembling C_log
-        uint256 call_log_norm;
-        uint256 put_log_norm;
-
-        assembly {
-            let P := 1000000000000000000
-
-            // density_term = s · cos(θ*)/2 = s/(2√(1+x*²))
-            let density_term := div(mul(s_vol, cos_theta_half), P)
-
-            // intrinsic_term = |m+μ| · survival
-            let intrinsic_term := div(mul(m_plus_mu, survival), P)
-
-            // C_log_raw = density_term + intrinsic_term  (if m+μ > 0)
-            // C_log_raw = density_term - intrinsic_term  (if m+μ < 0)
-            // Note: density_term is always positive
-            // When m+μ < 0 (OTM call), intrinsic_term contribution is negative
-            let c_log_raw := 0
-            switch m_plus_mu_neg
-            case 1 {
-                // m+μ < 0 (OTM): C_log = density - |intrinsic|
-                // density_term is always >= intrinsic when m+μ is negative
-                // because the PDF contribution dominates near the threshold
-                switch gt(density_term, intrinsic_term)
-                case 1 { c_log_raw := sub(density_term, intrinsic_term) }
-                default { c_log_raw := 0 }
-            }
-            default {
-                // m+μ >= 0 (ITM or ATM): both terms positive
-                c_log_raw := add(density_term, intrinsic_term)
-            }
-
-            // Apply discount: C_log = c_log_raw · discount / 1e18
-            call_log_norm := div(mul(c_log_raw, discount), P)
-
-            // Put via parity: P_log = C_log - (m+μ)·e^{-rT}
-            // forward = (m+μ) · discount
-            let forward_disc := div(mul(m_plus_mu, discount), P)
-
-            switch m_plus_mu_neg
-            case 1 {
-                // m+μ < 0: put = call + |forward|
-                put_log_norm := add(call_log_norm, forward_disc)
-            }
-            default {
-                // m+μ >= 0: put = call - forward (could be zero)
-                switch gt(call_log_norm, forward_disc)
-                case 1 { put_log_norm := sub(call_log_norm, forward_disc) }
-                default { put_log_norm := 0 }
-            }
-
-            // Deltas (log-space): probability of exercise
-            delta_call := survival
-            delta_put := sub(P, survival)
-        }
-
-        // ═══════════════════════════════════════════════════
-        // Convert from log-space to price-space
-        //   C_price = S · (exp(C_log_norm) - 1)
-        //   For small values, exp(x)-1 ≈ x, so price ≈ S · C_log_norm
-        // ═══════════════════════════════════════════════════
-        if (call_log_norm > 0) {
-            uint256 exp_call = TMaths.exp(true, call_log_norm);
-            assembly {
-                let P := 1000000000000000000
-                // exp_call - 1 (both are 1e18-scaled, so subtract 1e18)
-                let call_norm := sub(exp_call, P)
-                call_price := div(mul(call_norm, S), P)
-            }
-        }
-
-        if (put_log_norm > 0) {
-            uint256 exp_put = TMaths.exp(true, put_log_norm);
-            assembly {
-                let P := 1000000000000000000
-                let put_norm := sub(exp_put, P)
-                put_price := div(mul(put_norm, S), P)
-            }
-        }
+    /// @dev The rounding margin in wei for prices on S and K (WAD).
+    function _margin(uint256 S, uint256 K) private pure returns (uint256) {
+        return MARGIN_WEI + FPML.mulDivUp(S + K, MARGIN_PER_UNIT, WAD);
     }
 }
