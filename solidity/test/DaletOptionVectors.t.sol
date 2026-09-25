@@ -70,6 +70,26 @@ contract DaletOptionVectorsTest is Test {
         }
     }
 
+    function _checkDown(string memory id, string memory name, uint256 got, uint256 fl, uint256 tol)
+        internal
+    {
+        console.log(id, name, got);
+        assertLe(got, fl, string.concat(id, " ", name, ": above the exact value (lower bound)"));
+        assertLe(fl - got, tol, string.concat(id, " ", name, ": shortfall below the exact value"));
+    }
+
+    /// @dev The lower-bound pricer: call and put at or below the floor of the exact value, and
+    ///      within the same margin as `price` above it.
+    function test_PriceLowerVectors() public {
+        PriceVector[] memory vs = DaletOptionVectors.prices();
+        for (uint256 i = 0; i < vs.length; i++) {
+            PriceVector memory v = vs[i];
+            (uint256 c, uint256 p) = DaletOption.priceLower(v.S, v.K, v.T, v.r, v.sigma);
+            _checkDown(v.id, "call_lower", c, v.fc[0], _tol(v, v.fc[1]));
+            _checkDown(v.id, "put_lower", p, v.fc[2], _tol(v, v.fc[3]));
+        }
+    }
+
     function test_CdfVectors() public {
         CdfVector[] memory vs = DaletOptionVectors.cdf();
         for (uint256 i = 0; i < vs.length; i++) {

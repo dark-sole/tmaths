@@ -29,7 +29,8 @@ import {FixedPointMathLib as FPML} from "solady/utils/FixedPointMathLib.sol";
 ///      is never below the exact price (tested against the vectors). The margin covering the
 ///      approximation error of lnWad and expWad is MARGIN_WEI plus MARGIN_PER_UNIT wei per unit
 ///      of S + K; see `_margin`. Each price carries one margin, so C - P departs from
-///      S - K e^{-rT} by at most the two margins.
+///      S - K e^{-rT} by at most the two margins. `priceLower` is the same core less the margin,
+///      floored at zero: at or below the exact prices, for a leg that is subtracted.
 ///
 ///      Deltas are the derivatives of the prices in S (ruling 22''):
 ///        delta_call = dC/dS = 1 - e^{-C_log} (1 - D(w)),  delta_put = -dP/dS = 1 - delta_call,
@@ -90,6 +91,39 @@ library DaletOption {
         uint256 delta_call,
         uint256 delta_put
     ) {
+        uint256 c;
+        uint256 p;
+        (c, p, delta_call, delta_put) = _core(S, K, T, r, sigma);
+        uint256 margin = _margin(S, K);
+        call_price = c + margin;
+        put_price = p + margin;
+    }
+
+    /// @notice The lower-bound pricer beside `price`: its call and put are at or below the exact
+    ///         prices, for the leg of a spread that is subtracted (a difference of two prices
+    ///         rounded up is not rounded up). The core's result less its margin, floored at zero;
+    ///         `price` less the lower bound is at most two margins. Inputs and reverts as `price`.
+    function priceLower(
+        uint256 S,
+        uint256 K,
+        uint256 T,
+        uint256 r,
+        uint256 sigma
+    ) internal pure returns (uint256 call_lower, uint256 put_lower) {
+        (uint256 c, uint256 p,,) = _core(S, K, T, r, sigma);
+        uint256 margin = _margin(S, K);
+        call_lower = c > margin ? c - margin : 0;
+        put_lower = p > margin ? p - margin : 0;
+    }
+
+    /// @dev The prices before the margin (each carried up through its steps) and the deltas.
+    function _core(
+        uint256 S,
+        uint256 K,
+        uint256 T,
+        uint256 r,
+        uint256 sigma
+    ) private pure returns (uint256 c, uint256 p, uint256 delta_call, uint256 delta_put) {
         if (S == 0) revert ZeroSpot();
         if (K == 0) revert ZeroStrike();
         if (T == 0) revert ZeroTime();
@@ -118,9 +152,8 @@ library DaletOption {
         // Discount e^{-rT}, WAD, rounded up by one wei for the put.
         uint256 disc = uint256(FPML.expWad(-int256(r * T / WAD))) + 1;
 
-        uint256 margin = _margin(S, K);
-        call_price = FPML.fullMulDivUp(S, omC, RAY) + margin;
-        put_price = FPML.fullMulDivUp(FPML.fullMulDivUp(K, disc, WAD), omP, RAY) + margin;
+        c = FPML.fullMulDivUp(S, omC, RAY);
+        p = FPML.fullMulDivUp(FPML.fullMulDivUp(K, disc, WAD), omP, RAY);
 
         // Deltas: 1 - D(w) by the stable tail when w >= 0, else D(|w|) = 1 - tail.
         uint256 tail = _tail(q, a);

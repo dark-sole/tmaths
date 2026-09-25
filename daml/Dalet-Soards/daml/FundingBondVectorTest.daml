@@ -1,0 +1,182 @@
+-- Copyright © 2026 Tokenisys (The Dark Sole Enterprise Ltd). All rights reserved.
+--
+-- FundingBond.daml against the funding bond reference vectors (PERP vectors.json), and the
+-- gap-claim grid of brief 2026-09-25b stage 3e as a scan. Every output on the side of the exact
+-- value its direction names and within the margin chosen for it; rates within three units in the
+-- last place. Every result is traced as `FB id output value`, and the largest excess of each
+-- function over its exact value as `FBWORST fn count excess`.
+
+module FundingBondVectorTest where
+
+import Daml.Script
+import DA.Foldable (forA_)
+import DA.List ((!!))
+import qualified DA.Text as T
+import qualified DA.Numeric as N
+import DaletOption
+import TMaths
+import FundingBond
+import FundingBondVectors
+
+ulp : N18
+ulp = 0.000000000000000001
+
+-- | The function a vector names, on its arguments: (value, second value), the second for the
+--   Itô transfer's amount received.
+run : Text -> [N18] -> Either Text (N18, N18)
+run fn a = case fn of
+  "knock_in_log"    -> one (knockInLog (a !! 0) (a !! 1))
+  "knock_in_long"   -> one (knockInLong (a !! 0) (a !! 1) (a !! 2))
+  "knock_in_short"  -> one (knockInShort (a !! 0) (a !! 1) (a !! 2))
+  "gap_claim_long"  -> one (gapClaimLong (a !! 0) (a !! 1) (a !! 2) (a !! 3))
+  "gap_claim_short" -> one (gapClaimShort (a !! 0) (a !! 1) (a !! 2) (a !! 3))
+  "premium"         -> Right (premium (a !! 0) (a !! 1) (a !! 2), 0.0)
+  "cap"             -> one (capOf (strikes a) (sizes a) (a !! 0))
+  "floor"           -> one (floorOf (strikes a) (sizes a) (a !! 0))
+  "ito_transfer"    -> Right (itoPaid (a !! 0) (a !! 1) (a !! 2), itoReceived (a !! 0) (a !! 1) (a !! 2))
+  "basis_log"       -> one (basisLog (a !! 0) (a !! 1))
+  "basis_log_ticks" -> one (basisLogTicks (truncate (a !! 0)) (truncate (a !! 1)))
+  "to_ratio"        -> Right (toRatio (a !! 0), 0.0)
+  _                 -> Left ("unknown fn " <> fn)
+  where
+    one = fmap (\x -> (x, 0.0))
+
+-- | [U, K1, q1, K2, q2, ...] to the Strikes and the sizes.
+strikes : [N18] -> [N18]
+strikes a = everyOther (drop 1 a)
+
+sizes : [N18] -> [N18]
+sizes a = everyOther (drop 2 a)
+
+everyOther : [a] -> [a]
+everyOther (x :: _ :: rest) = x :: everyOther rest
+everyOther [x] = [x]
+everyOther [] = []
+
+direction : Text -> Text
+direction fn
+  | fn == "cap" = "down"
+  | fn `elem` ["basis_log", "basis_log_ticks", "to_ratio"] = "none"
+  | otherwise = "up"
+
+-- | The margin allowed over the exact value.
+tol : FBVector -> N18
+tol v
+  | v.fn `elem` ["gap_claim_long", "gap_claim_short"] =
+      let k = v.args !! 0
+          x = v.args !! 1
+      in 2.0 * (marginN k k + marginN k x) + 4.0 * ulp
+  | otherwise = 3.0 * ulp
+
+traceFB : Text -> Text -> N18 -> Script ()
+traceFB i name x = debug ("FB " <> i <> " " <> name <> " " <> show x)
+
+-- | Checks one output in its direction; returns its excess over (or shortfall below) exact.
+check : FBVector -> Text -> Text -> N18 -> Script N18
+check v dir name got = do
+  traceFB v.vid name got
+  let t = tol v
+      at = v.vid <> " " <> name <> ": "
+  case dir of
+    "up" -> do
+      assertMsg (at <> "below the exact value (up)") (got >= v.hi)
+      assertMsg (at <> "excess " <> show (got - v.hi)) (got - v.hi <= t)
+      pure (got - v.hi)
+    "down" -> do
+      assertMsg (at <> "above the exact value (down)") (got <= v.lo)
+      assertMsg (at <> "shortfall " <> show (v.lo - got)) (v.lo - got <= t)
+      pure (v.lo - got)
+    _ -> do
+      assertMsg (at <> "error") (got >= v.lo - t && got <= v.hi + t)
+      pure (if got < v.lo then v.lo - got else if got > v.hi then got - v.hi else 0.0)
+
+checkVector : FBVector -> Script N18
+checkVector v = case run v.fn v.args of
+  Left msg -> do
+    assertMsg (v.vid <> ": refused " <> msg) False
+    pure 0.0
+  Right (r0, r1) ->
+    if v.fn == "ito_transfer"
+      then do
+        e0 <- check v "up" "paid" r0
+        e1 <- check v "down" "received" r1
+        pure (max e0 e1)
+      else check v (direction v.fn) "value" r0
+
+testVectors : Script ()
+testVectors = do
+  excess <- mapA checkVector fbVectors
+  let fns = ["knock_in_log", "knock_in_long", "knock_in_short", "gap_claim_long", "gap_claim_short",
+             "premium", "cap", "floor", "ito_transfer", "basis_log", "basis_log_ticks", "to_ratio"]
+      rows = zip fbVectors excess
+  forA_ fns \f -> do
+    let es = [e | (v, e) <- rows, v.fn == f]
+    debug ("FBWORST " <> f <> " " <> show (length es) <> " " <> show (foldl max 0.0 es))
+
+testSettles : Script ()
+testSettles = forA_ settleVectors \v -> do
+  let f = basisRate (either (const 0.0) identity (basisLog v.ap v.ai)) v.ratio
+      idx = [0 .. length v.qs - 1]
+      payers = [i | i <- idx, v.pays !! i]
+      receivers = [i | i <- idx, not (v.pays !! i)]
+      qr = sum [v.qs !! i | i <- receivers]
+  forA_ idx \i ->
+    assertMsg (v.sid <> ": payer side") ((v.pays !! i) == (if f > 0.0 then v.isLong !! i else not (v.isLong !! i)))
+  paid <- mapA (\i -> do
+      let got = basisPay f (v.qs !! i) v.ai
+          t : Numeric 24 = N.mul (N.mul (basisRateErr + 3.0 * ulp) (v.qs !! i) : Numeric 24) v.ai
+      traceFB v.sid "pays" got
+      assertMsg (v.sid <> ": pays below the exact value (up)") (got >= v.his !! i)
+      assertMsg (v.sid <> ": pays excess") (got - v.his !! i <= (N.castAndRound t : N18) + 3.0 * ulp)
+      pure got) payers
+  let total = sum paid
+  received <- mapA (\i -> do
+      let own = either (const 0.0) identity (basisReceive v.totalFloor (v.qs !! i) qr)
+          got = either (const 0.0) identity (basisReceive total (v.qs !! i) qr)
+      assertMsg (v.sid <> ": receives above the exact value (down)") (own <= v.los !! i)
+      assertMsg (v.sid <> ": receives shortfall") (v.los !! i - own <= 3.0 * ulp)
+      traceFB v.sid "receives" got
+      assertMsg (v.sid <> ": receiver shorted") (got + 2.0 * ulp >= v.los !! i)
+      pure got) receivers
+  let dust = total - sum received
+  traceFB v.sid "dust" dust
+  assertMsg (v.sid <> ": negative dust") (dust >= 0.0)
+
+testLefts : Script ()
+testLefts = forA_ leftVectors \v -> case run v.lfn v.largs of
+  Left msg -> assertMsg (v.lid <> ": wrong refusal " <> msg) (T.isInfixOf v.reason msg)
+  Right _  -> assertMsg (v.lid <> ": priced, expected " <> v.reason) False
+
+-- | Stage 3e: the gap claim at or above the model's exact value on the grid, Strikes 0.02 to
+--   50, floors and caps a tenth to nine tenths away.
+testGapClaimGrid : Script ()
+testGapClaimGrid = do
+  assertMsg "234 grid points" (length gridVectors == 234)
+  excess <- mapA (\g -> do
+      let r = if g.glong then gapClaimLong g.gk g.gx sigmaGrid hGrid
+                         else gapClaimShort g.gk g.gx sigmaGrid hGrid
+      case r of
+        Left msg -> do
+          assertMsg ("grid K " <> show g.gk <> ": refused " <> msg) False
+          pure 0.0
+        Right got -> do
+          assertMsg ("grid K " <> show g.gk <> " X " <> show g.gx <> ": below the exact value")
+            (got >= g.gceil)
+          pure (got - g.gceil)) gridVectors
+  debug ("FBGRID " <> show (length excess) <> " worst excess " <> show (foldl max 0.0 excess))
+
+-- | The largest excess over (or shortfall below) exact per function and on the grid, for the
+--   error report: run with
+--   daml script --dar .daml/dist/dalet-option-1.0.0.dar
+--     --script-name FundingBondVectorTest:reportFundingBond --ide-ledger --output-file <file>
+reportFundingBond : Script [(Text, Int, Numeric 18)]
+reportFundingBond = do
+  excess <- mapA checkVector fbVectors
+  let fns = ["knock_in_log", "knock_in_long", "knock_in_short", "gap_claim_long", "gap_claim_short",
+             "premium", "cap", "floor", "ito_transfer", "basis_log", "basis_log_ticks", "to_ratio"]
+      rows = zip fbVectors excess
+      per f = let es = [e | (v, e) <- rows, v.fn == f] in (f, length es, foldl max 0.0 es)
+      grid = [ either (const 0.0) (\x -> x - g.gceil)
+                 (if g.glong then gapClaimLong g.gk g.gx sigmaGrid hGrid
+                             else gapClaimShort g.gk g.gx sigmaGrid hGrid) | g <- gridVectors ]
+  pure (map per fns <> [("grid", length grid, foldl max 0.0 grid)])

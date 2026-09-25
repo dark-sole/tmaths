@@ -1,0 +1,278 @@
+-- Copyright © 2026 Tokenisys (The Dark Sole Enterprise Ltd). All rights reserved.
+--
+-- FundingBond: the funding bond's charges for Canton venues, on DaletOption (ruling 22'').
+--
+-- The standard is PERP/reference/fundingbond/model.py and its vectors.json; the authority is
+-- PERP/paper/FundingBond.tex with the Frozen rulings 18 to 30 in PERP HANDOFF.md. The functions
+-- are those of solidity/src/FundingBond.sol.
+--
+-- Ruling 25: Numeric 18 in and out. Rates and the knock-in bound are worked at 30 places
+-- (TMaths.W); amounts, which reach sizes times prices beyond W's eight integer digits, at 24
+-- (type A). Nothing here is Decimal: the cast belongs to the contract where a charge settles,
+-- `toDecimalUp` for an amount paid and `toDecimalDown` for one received (DaletOption).
+--
+-- Every output lies on the side of the exact value that its vector's direction names:
+--   up    knock-in, gap claim, premium, the floor, every amount a payer is charged
+--   down  the cap, every amount received
+--   none  rates (the basis in logs, its ratio, f), to nearest
+-- A result that is not exact at its working precision is moved past the working error (errW,
+-- errA) and then rounded to 18 places in its direction.
+--
+-- Knock-in (ruling 18): min(1, 2 D(-y)), y = d/sqrt(dV), in the stable form 1/(q (q + y)),
+-- q = sqrt(1 + y^2); for y >= 1 in u = 1/y, u^2 / (r (r + 1)), r = sqrt(1 + u^2), so that
+-- y^2 never exceeds W's range.
+--
+-- Gap claim (rulings 19 and 29): the leg at the Strike by daletPriceE (up) less the leg at the
+-- floor or cap by daletPriceLowerE (at or below exact). A Strike at or beyond the floor or cap
+-- has no cover: the claim is 0.
+--
+-- Cap and floor (ruling 19): the caller supplies one entry per Strike with its aggregate
+-- delivered size, Strikes strictly ascending, and bounds the length; no fold over positions.
+--
+-- Itô transfer (rulings 20 and 30) and basis (rulings 24, 26, 27 and 28): each amount paid is
+-- rounded up and each amount received down; the dust is the venue's (for PERP, the
+-- underwriters' vault's). The basis is computed per position; the venue keeps the book.
+
+module FundingBond where
+
+import qualified DA.Numeric as N
+import TMaths
+import DaletOption
+
+-- | The working type for amounts: 24 places, 14 integer digits.
+type A = Numeric 24
+
+-- | Working errors allowed before a directed rounding to 18 places.
+errW : W
+errW = 0.000000000000000000000000001
+
+errA : A
+errA = 0.00000000000000000001
+
+-- | The error of a basis rate f at 18 places carried up into every amount paid.
+basisRateErr : N18
+basisRateErr = 0.000000000000000002
+
+-- | ln(1.0001) at 30 places.
+lnTickW : W
+lnTickW = 0.000099995000333308335333166681
+
+-- | 1/sqrt(2) at 30 places.
+invSqrt2W : W
+invSqrt2W = 0.707106781186547524400844362105
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Directed rounding to 18 places
+-- ═══════════════════════════════════════════════════════════════════════════
+
+ceilW : W -> N18
+ceilW x = let r : N18 = N.castAndRound x in if (N.cast r : W) < x then r + ulpN else r
+
+floorW : W -> N18
+floorW x = let r : N18 = N.castAndRound x in if (N.cast r : W) > x then r - ulpN else r
+
+ceilA : A -> N18
+ceilA x = let r : N18 = N.castAndRound x in if (N.cast r : A) < x then r + ulpN else r
+
+floorA : A -> N18
+floorA x = let r : N18 = N.castAndRound x in if (N.cast r : A) > x then r - ulpN else r
+
+-- | Up past the working error; zero stays zero.
+upW : W -> N18
+upW x = if x == 0.0 then 0.0 else ceilW (x + errW)
+
+upA : A -> N18
+upA x = if x == 0.0 then 0.0 else ceilA (x + errA)
+
+-- | Down past the working error, bounded below by zero.
+downA : A -> N18
+downA x = if x == 0.0 then 0.0 else max 0.0 (floorA (x - errA))
+
+nearestW : W -> N18
+nearestW = N.castAndRound
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Knock-in (ruling 18)
+-- ═══════════════════════════════════════════════════════════════════════════
+
+-- | The bound at log distance d > 0 (W) while dV > 0 accrues, rounded up.
+knockInW : W -> N18 -> N18
+knockInW d dV =
+  let sd = sqrtW (N.cast dV)
+      k = if d >= sd
+            then let u = sd / d
+                     u2 = u * u
+                     r = sqrtW (1.0 + u2)
+                 in u2 / (r * (r + 1.0))
+            else let y = d / sd
+                     q = sqrtW (1.0 + y * y)
+                 in 1.0 / (q * (q + y))
+  in min 1.0 (upW k)
+
+-- | The knock-in bound at log distance d > 0 from the Strike while variance dV accrues,
+--   rounded up; 0 when dV = 0. A venue on ticks passes d = (tick distance) x ln(1.0001).
+knockInLog : N18 -> N18 -> Either Text N18
+knockInLog d dV
+  | d <= 0.0  = Left "FundingBond: KnockedIn: d <= 0"
+  | dV < 0.0  = Left "FundingBond: dV must not be negative"
+  | dV == 0.0 = Right 0.0
+  | otherwise = Right (knockInW (N.cast d) dV)
+
+-- | A long recorded at s0 with Strike k: d = ln(s0/k).
+knockInLong : N18 -> N18 -> N18 -> Either Text N18
+knockInLong s0 k dV
+  | k <= 0.0  = Left "FundingBond: strike must be positive"
+  | s0 <= k   = Left "FundingBond: KnockedIn: S0 <= K"
+  | otherwise = fromDistance (lnW s0 - lnW k) dV
+
+-- | A short recorded at s0 with Strike kS, by reflection: d = ln(kS/s0).
+knockInShort : N18 -> N18 -> N18 -> Either Text N18
+knockInShort s0 kS dV
+  | s0 <= 0.0 = Left "FundingBond: spot must be positive"
+  | s0 >= kS  = Left "FundingBond: KnockedIn: S0 >= K_S"
+  | otherwise = fromDistance (lnW kS - lnW s0) dV
+
+-- | A distance lost to the working error prices at the bound's ceiling, 1.
+fromDistance : W -> N18 -> Either Text N18
+fromDistance d dV
+  | dV < 0.0  = Left "FundingBond: dV must not be negative"
+  | dV == 0.0 = Right 0.0
+  | d <= errW = Right 1.0
+  | otherwise = Right (knockInW (d - errW) dV)
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Spreads on the available capital (rulings 19 and 29)
+-- ═══════════════════════════════════════════════════════════════════════════
+
+-- | A long's gap claim per unit of delivered size: the put at the Strike less the put at the
+--   floor, each from the Strike over h at r = 0, rounded up. Floor 0 prices the Strike leg
+--   alone; a floor at or above k has no cover and the claim is 0.
+gapClaimLong : N18 -> N18 -> N18 -> N18 -> Either Text N18
+gapClaimLong k fl sigma h
+  | fl < 0.0  = Left "FundingBond: the floor must not be negative"
+  | fl >= k   = Right 0.0
+  | otherwise = do
+      leg <- (.putPrice) <$> daletPriceE k k h 0.0 sigma
+      if fl == 0.0 then pure leg else do
+        (_, lower) <- daletPriceLowerE k fl h 0.0 sigma
+        pure (max 0.0 (leg - lower))
+
+-- | A short's gap claim: the call at the Strike less the call at the cap, rounded up. A cap at
+--   or below kS has no cover and the claim is 0.
+gapClaimShort : N18 -> N18 -> N18 -> N18 -> Either Text N18
+gapClaimShort kS cp sigma h
+  | cp <= 0.0 = Left "FundingBond: ZeroCap: the cap must be positive"
+  | cp <= kS  = Right 0.0
+  | otherwise = do
+      leg <- (.callPrice) <$> daletPriceE kS kS h 0.0 sigma
+      (lower, _) <- daletPriceLowerE kS cp h 0.0 sigma
+      pure (max 0.0 (leg - lower))
+
+-- | The premium for one interval: size x knock-in x gap claim, rounded up.
+premium : N18 -> N18 -> N18 -> N18
+premium size ki gc = upA (N.mul (N.mul size ki : A) gc)
+
+checkBook : [N18] -> [N18] -> N18 -> Either Text [(N18, N18)]
+checkBook ks qs u
+  | null ks                  = Left "FundingBond: EmptyBook"
+  | length ks /= length qs   = Left "FundingBond: LengthMismatch"
+  | u <= 0.0                 = Left "FundingBond: ZeroCapital"
+  | any (<= 0.0) ks          = Left "FundingBond: ZeroStrike"
+  | any (<= 0.0) qs          = Left "FundingBond: ZeroSize"
+  | not (ascending ks)       = Left "FundingBond: NotAscending"
+  | otherwise                = Right (zip ks qs)
+
+ascending : [N18] -> Bool
+ascending (a :: b :: rest) = a < b && ascending (b :: rest)
+ascending _ = True
+
+-- | The cap S*: the price at which the liability of knocked-in shorts,
+--   sum over K_j < S of q_j (S - K_j), reaches the capital u. Rounded down.
+capOf : [N18] -> [N18] -> N18 -> Either Text N18
+capOf ks qs u = do
+  book <- checkBook ks qs u
+  pure (capGo u book 0.0 0.0)
+
+capGo : N18 -> [(N18, N18)] -> A -> A -> N18
+capGo u ((k, q) :: rest) qq qk =
+  let q' = qq + N.cast q
+      qk' = qk + N.mul q k
+      s : A = (N.cast u + qk') / q'
+  in case rest of
+       [] -> downA s
+       ((kn, _) :: _) -> if N.cast u + qk' <= N.cast kn * q' then downA s else capGo u rest q' qk'
+capGo _ [] _ _ = 0.0
+
+-- | The floor S_*: the price at which the liability of knocked-in longs,
+--   sum over K_j > S of q_j (K_j - S), reaches u; 0 when u covers the whole book. Rounded up
+--   (towards the Strike). Zero only once every Strike is counted.
+floorOf : [N18] -> [N18] -> N18 -> Either Text N18
+floorOf ks qs u = do
+  book <- checkBook ks qs u
+  pure (floorGo u (reverse book) 0.0 0.0)
+
+floorGo : N18 -> [(N18, N18)] -> A -> A -> N18
+floorGo u ((k, q) :: rest) qq qk =
+  let q' = qq + N.cast q
+      qk' = qk + N.mul q k
+      ex : A = qk' - N.cast u
+  in case rest of
+       [] -> if ex <= 0.0 then 0.0 else upA (ex / q')
+       ((kn, _) :: _) ->
+         if ex > 0.0 && ex >= N.cast kn * q' then upA (ex / q') else floorGo u rest q' qk'
+floorGo _ [] _ _ = 0.0
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- The Itô transfer (rulings 20 and 30)
+-- ═══════════════════════════════════════════════════════════════════════════
+
+itoExact : N18 -> N18 -> N18 -> A
+itoExact q a dV = N.mul (N.mul q a : A) dV / 2.0
+
+-- | What a long pays for one period: 1/2 dV x q x A_index, rounded up.
+itoPaid : N18 -> N18 -> N18 -> N18
+itoPaid q a dV = upA (itoExact q a dV)
+
+-- | What a short receives for one period, rounded down.
+itoReceived : N18 -> N18 -> N18 -> N18
+itoReceived q a dV = downA (itoExact q a dV)
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- The basis (rulings 21, 24, 26, 27 and 28), per position
+-- ═══════════════════════════════════════════════════════════════════════════
+
+-- | r_log = ln(A_perp/A_index), to nearest.
+basisLog : N18 -> N18 -> Either Text N18
+basisLog ap ai
+  | ap <= 0.0 || ai <= 0.0 = Left "FundingBond: averages must be positive"
+  | otherwise              = Right (nearestW (lnW ap - lnW ai))
+
+-- | r_log from PERP's tick running totals: (dS_perp - dS_pool)/dt x ln(1.0001), dTickTime =
+--   dS_perp - dS_pool (tick x seconds) and dt in seconds, both integers.
+basisLogTicks : Int -> Int -> Either Text N18
+basisLogTicks dTickTime dt
+  | dt <= 0   = Left "FundingBond: ZeroInterval"
+  | otherwise =
+      let m : W = N.div (intToNumeric dTickTime : Numeric 0) (intToNumeric dt : Numeric 0)
+      in Right (nearestW (m * lnTickW))
+
+-- | The conversion r = e^{r_log} - 1, to nearest.
+toRatio : N18 -> N18
+toRatio rLog = nearestW (expm1W (N.cast rLog))
+
+-- | f: the chosen form over sqrt(2); ratio True converts r_log first. To nearest.
+basisRate : N18 -> Bool -> N18
+basisRate rLog ratio =
+  let x : W = if ratio then expm1W (N.cast rLog) else N.cast rLog
+  in nearestW (x * invSqrt2W)
+
+-- | What one payer pays: |f| x q x A_index, rounded up, with the rate's own error.
+basisPay : N18 -> N18 -> N18 -> N18
+basisPay f q a = if f == 0.0 then 0.0 else upA (N.mul (N.mul (abs f + basisRateErr) q : A) a)
+
+-- | What one receiver receives: total x q / qReceivers, rounded down. The sum paid less the sum
+--   received is the dust (rulings 27 and 28), never negative.
+basisReceive : N18 -> N18 -> N18 -> Either Text N18
+basisReceive total q qr
+  | qr <= 0.0 = Left "FundingBond: ZeroReceivers"
+  | otherwise = Right (downA (N.mul total q / N.cast qr))

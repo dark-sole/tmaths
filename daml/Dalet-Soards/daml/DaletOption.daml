@@ -22,6 +22,8 @@
 -- directed: `toDecimalUp` for an amount a payer is charged, `toDecimalDown` for one received.
 --
 -- Rounding: call and put are charged amounts, rounded up: each is at or above the exact price.
+-- `daletPriceLowerE` is the same core less the margin, floored at zero: at or below the exact
+-- prices, for a leg that is subtracted.
 -- The margin covers the rounding to 18 places (half a unit) and the 30-place working error:
 -- 2 units in the last place plus one per 1e9 of S + K. Each price carries one margin, so
 -- C - P departs from S - K e^{-rT} by at most the two margins.
@@ -57,7 +59,30 @@ marginN s k = intToNumeric (2 + truncate ((s + k) / 1000000000.0)) * ulpN
 
 -- | The pricer, Numeric 18 in and out; Left on inputs outside its domain.
 daletPriceE : N18 -> N18 -> N18 -> N18 -> N18 -> Either Text OptionResult
-daletPriceE s k t r sigma
+daletPriceE s k t r sigma = do
+  (c, p, dc, dp) <- daletCoreE s k t r sigma
+  let margin = marginN s k
+  pure OptionResult with
+    callPrice = c + margin; putPrice = p + margin; deltaCalls = dc; deltaPut = dp
+
+-- | The lower-bound pricer beside daletPriceE: call and put at or below the exact prices, for
+--   the leg of a spread that is subtracted (a difference of two prices rounded up is not rounded
+--   up). The core's result less its margin, floored at zero. Returns (call, put).
+daletPriceLowerE : N18 -> N18 -> N18 -> N18 -> N18 -> Either Text (N18, N18)
+daletPriceLowerE s k t r sigma = do
+  (c, p, _, _) <- daletCoreE s k t r sigma
+  let margin = marginN s k
+  pure (max 0.0 (c - margin), max 0.0 (p - margin))
+
+-- | The lower-bound pricer; aborts on inputs outside its domain.
+daletPriceLowerN : N18 -> N18 -> N18 -> N18 -> N18 -> (N18, N18)
+daletPriceLowerN s k t r sigma = case daletPriceLowerE s k t r sigma of
+  Left msg  -> error msg
+  Right res -> res
+
+-- | The prices before the margin, and the deltas: (call, put, deltaCalls, deltaPut).
+daletCoreE : N18 -> N18 -> N18 -> N18 -> N18 -> Either Text (N18, N18, N18, N18)
+daletCoreE s k t r sigma
   | s <= 0.0     = Left "DaletOption: spot must be positive"
   | k <= 0.0     = Left "DaletOption: strike must be positive"
   | t <= 0.0     = Left "DaletOption: time must be positive"
@@ -91,16 +116,14 @@ daletPriceE s k t r sigma
           -- Discount e^{-rT}
           disc : W = expW (negate rt)
 
-          margin = marginN s k
-          call : N18 = N.mul s omC + margin
-          put : N18 = N.mul k (disc * omP) + margin
+          call : N18 = N.mul s omC
+          put : N18 = N.mul k (disc * omP)
 
           -- Deltas: 1 - D(w) by the stable tail when w >= 0, its complement when w < 0
           tl : W = s2 / (2.0 * big * (big + al))
           survival = if lfk >= 0.0 then tl else 1.0 - tl
           dP : N18 = N.castAndRound ((1.0 - omC) * survival)
-        in Right OptionResult with
-             callPrice = call; putPrice = put; deltaCalls = 1.0 - dP; deltaPut = dP
+        in Right (call, put, 1.0 - dP, dP)
 
 -- | The pricer, Numeric 18 in and out; aborts on inputs outside its domain.
 daletPriceN : N18 -> N18 -> N18 -> N18 -> N18 -> OptionResult
